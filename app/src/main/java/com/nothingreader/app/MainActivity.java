@@ -1499,14 +1499,23 @@ public final class MainActivity extends Activity {
         StringBuilder css = new StringBuilder();
         css.append("html,body{background:").append(colorCss(palette.readerBackground)).append(";color:").append(colorCss(palette.text)).append(";}");
         if (webPaged) {
-            css.append("html{margin:0;padding:0;}");
-            css.append("body{margin:0;box-sizing:border-box;height:100vh;overflow:hidden;")
-                    .append("padding:").append(vPad).append("px ").append(hPad).append("px;")
-                    .append("column-width:calc(").append(100.0f / columns).append("vw - ").append(2 * hPad).append("px);")
-                    .append("column-gap:").append(2 * hPad).append("px;")
-                    .append("column-fill:auto;")
+            // 出版 EPUB 常自带 body{max-width/margin/padding/column} 等样式；
+            // 列宽推进量必须严格等于一屏宽，否则在宽屏（折叠屏内屏）上右侧列会漂出屏幕，
+            // 因此分页模式下用 !important 强制接管 html/body 的布局属性。
+            css.append("html{margin:0!important;padding:0!important;width:auto!important;max-width:none!important;height:auto!important;}");
+            css.append("body{margin:0!important;box-sizing:border-box!important;height:100vh!important;max-height:100vh!important;")
+                    .append("width:auto!important;max-width:none!important;min-width:0!important;min-height:0!important;")
+                    .append("overflow:hidden;writing-mode:horizontal-tb!important;")
+                    .append("padding:").append(vPad).append("px ").append(hPad).append("px!important;")
+                    .append("column-width:calc(").append(100.0f / columns).append("vw - ").append(2 * hPad).append("px)!important;")
+                    .append("column-count:auto!important;")
+                    .append("column-gap:").append(2 * hPad).append("px!important;")
+                    .append("column-fill:auto!important;")
                     .append("font-family:").append(fontFamily).append(";font-size:").append(settings.fontSp).append("px;line-height:").append(settings.lineMultiplier).append(";word-break:break-word;}");
-            css.append("img,svg,video{max-width:100%;max-height:calc(100vh - ").append(2 * vPad + 16).append("px);height:auto;display:block;margin:1em auto;}");
+            css.append("img,svg,video{max-width:100%!important;max-height:calc(100vh - ").append(2 * vPad + 16).append("px)!important;height:auto;display:block;margin:1em auto;break-inside:avoid;}");
+            css.append("pre{white-space:pre-wrap;word-break:break-all;max-width:100%!important;overflow:hidden;}");
+            css.append("table{max-width:100%!important;}");
+            css.append("p,div,section,article{max-width:none!important;}");
         } else {
             css.append("body{margin:0;padding:").append(vPad).append("px ").append(hPad).append("px ").append(vPad + 8).append("px;")
                     .append("font-family:").append(fontFamily).append(";font-size:").append(settings.fontSp).append("px;line-height:").append(settings.lineMultiplier).append(";word-break:break-word;}");
