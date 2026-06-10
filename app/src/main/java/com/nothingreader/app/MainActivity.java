@@ -78,6 +78,10 @@ public final class MainActivity extends Activity {
     private static final int MAX_SCROLL_MODE_TEXT_CHARS = 700_000;
     private static final int LAZY_PAGINATION_TEXT_CHARS = 700_000;
 
+    private interface PageTurnHandler {
+        void turn(int direction);
+    }
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable saveProgressRunnable = this::saveCurrentProgress;
 
@@ -92,6 +96,8 @@ public final class MainActivity extends Activity {
     private ReaderContent currentContent;
     private ScrollView readerScroll;
     private TextView readerText;
+    private LinearLayout readerToolbar;
+    private LinearLayout readerFooter;
     private TextView progressView;
     private final ArrayList<Integer> pageStarts = new ArrayList<>();
     private int pageIndex;
@@ -107,6 +113,7 @@ public final class MainActivity extends Activity {
     private float touchDownX;
     private float touchDownY;
     private boolean restoringScroll;
+    private boolean readerChromeVisible = true;
     private boolean lastExpandedLayout;
     private String shelfFormatFilter = "ALL";
     private PdfRenderer pdfRenderer;
@@ -327,6 +334,9 @@ public final class MainActivity extends Activity {
         currentContent = null;
         readerScroll = null;
         readerText = null;
+        readerToolbar = null;
+        readerFooter = null;
+        readerChromeVisible = true;
         lazyPagination = false;
         refreshPalette();
         applySystemChrome(palette.background);
@@ -1122,6 +1132,9 @@ public final class MainActivity extends Activity {
         applySystemChrome(palette.readerBackground);
         root.setBackgroundColor(palette.readerBackground);
         root.removeAllViews();
+        readerToolbar = null;
+        readerFooter = null;
+        readerChromeVisible = true;
 
         boolean expanded = isExpandedLayout();
         LinearLayout shell = new LinearLayout(this);
@@ -1136,6 +1149,7 @@ public final class MainActivity extends Activity {
         toolbar.setPadding(expanded ? dp(18) : dp(12), dp(8), expanded ? dp(18) : dp(12), dp(8));
         toolbar.setBackgroundColor(palette.readerBackground);
         shell.addView(toolbar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64)));
+        readerToolbar = toolbar;
 
         TextView back = iconButton("‹", "返回");
         back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 30);
@@ -1190,6 +1204,7 @@ public final class MainActivity extends Activity {
             });
         }
         readingFrame.addView(epubWebView, matchParent());
+        attachDocumentSurfaceGesture(epubWebView, this::epubPageTurn);
         addEpubTurnZones(readingFrame);
 
         LinearLayout footer = new LinearLayout(this);
@@ -1197,6 +1212,7 @@ public final class MainActivity extends Activity {
         footer.setPadding(expanded ? dp(28) : dp(18), dp(2), expanded ? dp(28) : dp(18), dp(10));
         footer.setBackgroundColor(palette.readerBackground);
         shell.addView(footer, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)));
+        readerFooter = footer;
 
         TextView previous = smallIconButton("‹", "上一章/上一屏");
         previous.setOnClickListener(view -> epubPageTurn(-1));
@@ -1219,40 +1235,14 @@ public final class MainActivity extends Activity {
         View previous = new View(this);
         previous.setBackgroundColor(Color.TRANSPARENT);
         previous.setClickable(true);
-        attachEpubGesture(previous, -1);
+        attachDocumentEdgeGesture(previous, this::epubPageTurn, -1);
         readingFrame.addView(previous, new FrameLayout.LayoutParams(dp(isExpandedLayout() ? 220 : 120), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.LEFT));
 
         View next = new View(this);
         next.setBackgroundColor(Color.TRANSPARENT);
         next.setClickable(true);
-        attachEpubGesture(next, 1);
+        attachDocumentEdgeGesture(next, this::epubPageTurn, 1);
         readingFrame.addView(next, new FrameLayout.LayoutParams(dp(isExpandedLayout() ? 260 : 140), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.RIGHT));
-    }
-
-    private void attachEpubGesture(View view, int direction) {
-        view.setOnTouchListener((target, event) -> {
-            if (!isEpubBook(currentBook)) {
-                return false;
-            }
-            if (event.getAction() == MotionEvent.ACTION_DOWN) {
-                touchDownX = event.getX();
-                touchDownY = event.getY();
-                return true;
-            }
-            if (event.getAction() == MotionEvent.ACTION_UP) {
-                float dx = event.getX() - touchDownX;
-                float dy = event.getY() - touchDownY;
-                if (Math.abs(dx) > dp(46) && Math.abs(dx) > Math.abs(dy) * 1.2f) {
-                    epubPageTurn(dx < 0 ? 1 : -1);
-                    return true;
-                }
-                if (Math.abs(dx) < dp(18) && Math.abs(dy) < dp(18)) {
-                    epubPageTurn(direction);
-                    return true;
-                }
-            }
-            return true;
-        });
     }
 
     private void loadEpubChapter(int index) {
@@ -1302,7 +1292,7 @@ public final class MainActivity extends Activity {
             return;
         }
         int height = Math.max(1, epubWebView.getHeight());
-        int step = Math.max(dp(160), Math.round(height * 0.86f));
+        int step = Math.max(dp(160), height);
         int max = Math.max(0, Math.round(epubWebView.getContentHeight() * epubWebView.getScale()) - height);
         int y = epubWebView.getScrollY();
         if (direction > 0) {
@@ -1386,6 +1376,9 @@ public final class MainActivity extends Activity {
         applySystemChrome(palette.readerBackground);
         root.setBackgroundColor(palette.readerBackground);
         root.removeAllViews();
+        readerToolbar = null;
+        readerFooter = null;
+        readerChromeVisible = true;
 
         boolean expanded = isExpandedLayout();
         LinearLayout shell = new LinearLayout(this);
@@ -1400,6 +1393,7 @@ public final class MainActivity extends Activity {
         toolbar.setPadding(expanded ? dp(18) : dp(12), dp(8), expanded ? dp(18) : dp(12), dp(8));
         toolbar.setBackgroundColor(palette.readerBackground);
         shell.addView(toolbar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64)));
+        readerToolbar = toolbar;
 
         TextView back = iconButton("‹", "返回");
         back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 30);
@@ -1459,6 +1453,7 @@ public final class MainActivity extends Activity {
             });
         }
         readingFrame.addView(markdownWebView, matchParent());
+        attachDocumentSurfaceGesture(markdownWebView, this::markdownPageTurn);
         addMarkdownTurnZones(readingFrame);
 
         LinearLayout footer = new LinearLayout(this);
@@ -1466,6 +1461,7 @@ public final class MainActivity extends Activity {
         footer.setPadding(expanded ? dp(28) : dp(18), dp(2), expanded ? dp(28) : dp(18), dp(10));
         footer.setBackgroundColor(palette.readerBackground);
         shell.addView(footer, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)));
+        readerFooter = footer;
 
         TextView previous = smallIconButton("‹", "上一屏");
         previous.setOnClickListener(view -> markdownPageTurn(-1));
@@ -1542,21 +1538,18 @@ public final class MainActivity extends Activity {
         View previous = new View(this);
         previous.setBackgroundColor(Color.TRANSPARENT);
         previous.setClickable(true);
-        attachMarkdownGesture(previous, -1);
+        attachDocumentEdgeGesture(previous, this::markdownPageTurn, -1);
         readingFrame.addView(previous, new FrameLayout.LayoutParams(dp(isExpandedLayout() ? 220 : 120), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.LEFT));
 
         View next = new View(this);
         next.setBackgroundColor(Color.TRANSPARENT);
         next.setClickable(true);
-        attachMarkdownGesture(next, 1);
+        attachDocumentEdgeGesture(next, this::markdownPageTurn, 1);
         readingFrame.addView(next, new FrameLayout.LayoutParams(dp(isExpandedLayout() ? 260 : 140), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.RIGHT));
     }
 
-    private void attachMarkdownGesture(View view, int direction) {
+    private void attachDocumentEdgeGesture(View view, PageTurnHandler handler, int direction) {
         view.setOnTouchListener((target, event) -> {
-            if (!isMarkdownBook(currentBook)) {
-                return false;
-            }
             if (event.getAction() == MotionEvent.ACTION_DOWN) {
                 touchDownX = event.getX();
                 touchDownY = event.getY();
@@ -1566,11 +1559,11 @@ public final class MainActivity extends Activity {
                 float dx = event.getX() - touchDownX;
                 float dy = event.getY() - touchDownY;
                 if (Math.abs(dx) > dp(46) && Math.abs(dx) > Math.abs(dy) * 1.2f) {
-                    markdownPageTurn(dx < 0 ? 1 : -1);
+                    handler.turn(dx < 0 ? 1 : -1);
                     return true;
                 }
                 if (Math.abs(dx) < dp(18) && Math.abs(dy) < dp(18)) {
-                    markdownPageTurn(direction);
+                    handler.turn(direction);
                     return true;
                 }
             }
@@ -1578,12 +1571,46 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private void attachDocumentSurfaceGesture(View view, PageTurnHandler handler) {
+        view.setOnTouchListener((target, event) -> {
+            if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                touchDownX = event.getX();
+                touchDownY = event.getY();
+                return false;
+            }
+            if (event.getAction() == MotionEvent.ACTION_UP) {
+                float dx = event.getX() - touchDownX;
+                float dy = event.getY() - touchDownY;
+                if (Math.abs(dx) > dp(46) && Math.abs(dx) > Math.abs(dy) * 1.2f) {
+                    handler.turn(dx < 0 ? 1 : -1);
+                    return true;
+                }
+                if (Math.abs(dx) < dp(18) && Math.abs(dy) < dp(18)) {
+                    turnOrToggleByHorizontalZone(target.getWidth(), event.getX(), handler);
+                    return true;
+                }
+            }
+            return false;
+        });
+    }
+
+    private void turnOrToggleByHorizontalZone(int width, float x, PageTurnHandler handler) {
+        int safeWidth = Math.max(1, width);
+        if (x < safeWidth * 0.34f) {
+            handler.turn(-1);
+        } else if (x > safeWidth * 0.66f) {
+            handler.turn(1);
+        } else {
+            toggleReaderChrome();
+        }
+    }
+
     private void markdownPageTurn(int direction) {
         if (markdownWebView == null) {
             return;
         }
         int height = Math.max(1, markdownWebView.getHeight());
-        int step = Math.max(dp(160), Math.round(height * 0.86f));
+        int step = Math.max(dp(160), height);
         int max = Math.max(0, Math.round(markdownWebView.getContentHeight() * markdownWebView.getScale()) - height);
         int y = markdownWebView.getScrollY();
         markdownWebView.scrollTo(0, Math.max(0, Math.min(max, y + direction * step)));
@@ -1650,6 +1677,9 @@ public final class MainActivity extends Activity {
         applySystemChrome(palette.readerBackground);
         root.setBackgroundColor(palette.readerBackground);
         root.removeAllViews();
+        readerToolbar = null;
+        readerFooter = null;
+        readerChromeVisible = true;
 
         try {
             openPdfRenderer(book);
@@ -1681,6 +1711,7 @@ public final class MainActivity extends Activity {
         toolbar.setPadding(expanded ? dp(18) : dp(12), dp(8), expanded ? dp(18) : dp(12), dp(8));
         toolbar.setBackgroundColor(palette.readerBackground);
         shell.addView(toolbar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64)));
+        readerToolbar = toolbar;
 
         TextView back = iconButton("‹", "返回");
         back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 30);
@@ -1763,6 +1794,7 @@ public final class MainActivity extends Activity {
         footer.setPadding(expanded ? dp(28) : dp(18), dp(2), expanded ? dp(28) : dp(18), dp(10));
         footer.setBackgroundColor(palette.readerBackground);
         shell.addView(footer, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)));
+        readerFooter = footer;
 
         TextView previous = smallIconButton("‹", "上一页");
         previous.setOnClickListener(view -> pdfPageTurn(-1));
@@ -1901,8 +1933,7 @@ public final class MainActivity extends Activity {
                     return true;
                 }
                 if (Math.abs(dx) < dp(18) && Math.abs(dy) < dp(18)) {
-                    int width = Math.max(1, target.getWidth());
-                    pdfPageTurn(event.getX() < width * 0.5f ? -1 : 1);
+                    turnOrToggleByHorizontalZone(target.getWidth(), event.getX(), this::pdfPageTurn);
                     return true;
                 }
             }
@@ -1976,6 +2007,9 @@ public final class MainActivity extends Activity {
         applySystemChrome(palette.readerBackground);
         root.setBackgroundColor(palette.readerBackground);
         root.removeAllViews();
+        readerToolbar = null;
+        readerFooter = null;
+        readerChromeVisible = true;
 
         boolean expanded = isExpandedLayout();
         LinearLayout shell = new LinearLayout(this);
@@ -1994,6 +2028,7 @@ public final class MainActivity extends Activity {
         toolbar.setPadding(expanded ? dp(18) : dp(12), dp(8), expanded ? dp(18) : dp(12), dp(8));
         toolbar.setBackgroundColor(palette.readerBackground);
         page.addView(toolbar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64)));
+        readerToolbar = toolbar;
 
         TextView back = iconButton("‹", "返回");
         back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 30);
@@ -2072,6 +2107,7 @@ public final class MainActivity extends Activity {
         footer.setPadding(expanded ? dp(28) : dp(18), dp(2), expanded ? dp(28) : dp(18), dp(10));
         footer.setBackgroundColor(palette.readerBackground);
         page.addView(footer, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, settings.pageMode ? dp(52) : dp(36)));
+        readerFooter = footer;
 
         progressView = text("0%", 12, palette.muted, Typeface.BOLD);
         if (settings.pageMode) {
@@ -2123,6 +2159,30 @@ public final class MainActivity extends Activity {
         if (currentBook != null && currentContent != null) {
             saveCurrentProgress();
             showReader(currentBook, currentContent);
+        }
+    }
+
+    private void toggleReaderChrome() {
+        if (readerToolbar == null || readerFooter == null) {
+            return;
+        }
+        int restoreOffset = currentVisibleOffset();
+        float epubProgress = isEpubBook(currentBook) && currentEpubDocument != null ? epubWebProgress() : -1.0f;
+        float markdownProgress = isMarkdownBook(currentBook) ? markdownWebProgress() : -1.0f;
+        readerChromeVisible = !readerChromeVisible;
+        int visibility = readerChromeVisible ? View.VISIBLE : View.GONE;
+        readerToolbar.setVisibility(visibility);
+        readerFooter.setVisibility(visibility);
+        if (settings.pageMode && currentBook != null && currentContent != null && readerText != null) {
+            readerText.postDelayed(() -> buildPagesForCurrentLayout(currentBook.progress, restoreOffset), 80);
+        } else if (epubProgress >= 0.0f) {
+            restoreEpubWebProgress(epubProgress, 90);
+        } else if (markdownProgress >= 0.0f) {
+            restoreMarkdownWebProgress(markdownProgress, 90);
+        } else if (isPdfBook(currentBook) && pdfImage != null) {
+            pdfImage.postDelayed(this::renderPdfPage, 80);
+        } else {
+            updateProgressLabel();
         }
     }
 
@@ -2194,8 +2254,20 @@ public final class MainActivity extends Activity {
                     pageTurn(dx < 0 ? 1 : -1);
                     return true;
                 }
-                if (Math.abs(dx) < dp(18) && Math.abs(dy) < dp(18) && tapDirection != 0) {
-                    pageTurn(tapDirection);
+                if (Math.abs(dx) < dp(18) && Math.abs(dy) < dp(18)) {
+                    if (tapDirection != 0) {
+                        pageTurn(tapDirection);
+                        return true;
+                    }
+                    int width = Math.max(1, target.getWidth());
+                    float x = event.getX();
+                    if (x < width * 0.34f) {
+                        pageTurn(-1);
+                    } else if (x > width * 0.66f) {
+                        pageTurn(1);
+                    } else {
+                        toggleReaderChrome();
+                    }
                     return true;
                 }
             }
@@ -2217,7 +2289,8 @@ public final class MainActivity extends Activity {
             return;
         }
         int contentWidth = Math.max(dp(240), readerText.getWidth() - readerText.getPaddingLeft() - readerText.getPaddingRight());
-        int contentHeight = Math.max(dp(280), readerText.getHeight() - readerText.getPaddingTop() - readerText.getPaddingBottom());
+        int rawContentHeight = readerText.getHeight() - readerText.getPaddingTop() - readerText.getPaddingBottom();
+        int contentHeight = Math.max(dp(260), rawContentHeight - pageBottomGuardPx());
         int estimatedChars = estimatedPageChars(contentWidth, contentHeight);
         if (shouldUseLazyPagination(text, estimatedChars)) {
             lazyPagination = true;
@@ -2331,6 +2404,16 @@ public final class MainActivity extends Activity {
         return Math.max(180, Math.round(charsPerLine * linesPerPage * 1.2f));
     }
 
+    private int pageBottomGuardPx() {
+        if (readerText == null) {
+            return dp(12);
+        }
+        Paint.FontMetricsInt metrics = readerText.getPaint().getFontMetricsInt();
+        int baseLineHeight = Math.max(1, metrics.descent - metrics.ascent + metrics.leading);
+        int lineHeight = Math.max(1, Math.round(baseLineHeight * settings.lineMultiplier));
+        return Math.max(dp(12), Math.round(lineHeight * 0.42f));
+    }
+
     private int measuredPageBreak(String text, int start, int contentWidth, int contentHeight, int estimatedChars) {
         if (start >= text.length()) {
             return text.length();
@@ -2351,7 +2434,7 @@ public final class MainActivity extends Activity {
                     return start + Math.max(1, layout.getLineEnd(0));
                 }
                 int measuredEnd = start + layout.getLineEnd(fitLine);
-                return chooseNaturalBreakNearEnd(text, start, measuredEnd);
+                return normalizeMeasuredPageEnd(text, start, measuredEnd);
             }
             int nextEnd = Math.min(text.length(), start + Math.round((windowEnd - start) * 1.7f));
             if (nextEnd <= windowEnd) {
@@ -2362,7 +2445,7 @@ public final class MainActivity extends Activity {
         if (layout != null) {
             int fitLine = lastFittingLine(layout, contentHeight);
             if (fitLine >= 0) {
-                return chooseNaturalBreakNearEnd(text, start, start + layout.getLineEnd(fitLine));
+                return normalizeMeasuredPageEnd(text, start, start + layout.getLineEnd(fitLine));
             }
         }
         return Math.min(text.length(), start + Math.max(1, estimatedChars));
@@ -2373,7 +2456,7 @@ public final class MainActivity extends Activity {
         StaticLayout.Builder builder = StaticLayout.Builder.obtain(text, 0, text.length(), paint, width)
                 .setAlignment(Layout.Alignment.ALIGN_NORMAL)
                 .setLineSpacing(0, settings.lineMultiplier)
-                .setIncludePad(true)
+                .setIncludePad(false)
                 .setBreakStrategy(Layout.BREAK_STRATEGY_HIGH_QUALITY)
                 .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE);
         return builder.build();
@@ -2389,6 +2472,14 @@ public final class MainActivity extends Activity {
             }
         }
         return last;
+    }
+
+    private int normalizeMeasuredPageEnd(String text, int start, int measuredEnd) {
+        int safeEnd = Math.max(start + 1, Math.min(measuredEnd, text.length()));
+        if (safeEnd < text.length() && Character.isHighSurrogate(text.charAt(safeEnd - 1)) && Character.isLowSurrogate(text.charAt(safeEnd))) {
+            safeEnd++;
+        }
+        return safeEnd;
     }
 
     private int chooseNaturalBreakNearEnd(String text, int start, int measuredEnd) {
@@ -2422,7 +2513,7 @@ public final class MainActivity extends Activity {
         int value = Math.max(0, Math.min(index, text.length()));
         while (value < text.length()) {
             char ch = text.charAt(value);
-            if (ch != '\n' && ch != '\r') {
+            if (!Character.isWhitespace(ch)) {
                 break;
             }
             value++;
@@ -2604,7 +2695,7 @@ public final class MainActivity extends Activity {
         readerText.setBackgroundColor(palette.readerBackground);
         readerText.setTextSize(TypedValue.COMPLEX_UNIT_SP, settings.fontSp);
         readerText.setLineSpacing(0, settings.lineMultiplier);
-        readerText.setIncludeFontPadding(true);
+        readerText.setIncludeFontPadding(!settings.pageMode);
         readerText.setBreakStrategy(Layout.BREAK_STRATEGY_HIGH_QUALITY);
         readerText.setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
