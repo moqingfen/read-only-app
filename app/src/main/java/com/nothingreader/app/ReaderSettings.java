@@ -11,6 +11,8 @@ final class ReaderSettings {
     String shelfSort = "recent";
     boolean shelfGrid = true;
     boolean pageMode = true;
+    boolean volumeTurn = true;
+    String spread = "auto";
 
     static ReaderSettings load(Context context) {
         SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -21,6 +23,8 @@ final class ReaderSettings {
         settings.shelfSort = prefs.getString("shelfSort", "recent");
         settings.shelfGrid = prefs.getBoolean("shelfGrid", true);
         settings.pageMode = prefs.getBoolean("pageMode", true);
+        settings.volumeTurn = prefs.getBoolean("volumeTurn", true);
+        settings.spread = prefs.getString("spread", "auto");
         return settings;
     }
 
@@ -33,6 +37,8 @@ final class ReaderSettings {
                 .putString("shelfSort", shelfSort)
                 .putBoolean("shelfGrid", shelfGrid)
                 .putBoolean("pageMode", pageMode)
+                .putBoolean("volumeTurn", volumeTurn)
+                .putString("spread", spread)
                 .apply();
     }
 }

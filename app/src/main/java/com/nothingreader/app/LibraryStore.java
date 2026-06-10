@@ -133,6 +133,44 @@ final class LibraryStore {
         return book;
     }
 
+    Book findExisting(Uri uri, List<Book> books) {
+        if (uri == null || books == null || books.isEmpty()) {
+            return null;
+        }
+        ContentResolver resolver = context.getContentResolver();
+        String displayName = getDisplayName(resolver, uri);
+        if (displayName == null || displayName.trim().isEmpty()) {
+            return null;
+        }
+        long size = getFileSize(resolver, uri);
+        for (Book book : books) {
+            if (book.fileName == null || !book.fileName.equals(displayName)) {
+                continue;
+            }
+            if (size <= 0) {
+                return book;
+            }
+            File local = book.localPath == null ? null : new File(book.localPath);
+            if (local != null && local.exists() && local.length() == size) {
+                return book;
+            }
+        }
+        return null;
+    }
+
+    private static long getFileSize(ContentResolver resolver, Uri uri) {
+        try (Cursor cursor = resolver.query(uri, null, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(OpenableColumns.SIZE);
+                if (index >= 0 && !cursor.isNull(index)) {
+                    return cursor.getLong(index);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return -1;
+    }
+
     void deleteBook(Book book) {
         if (book.localPath != null) {
             File file = new File(book.localPath);

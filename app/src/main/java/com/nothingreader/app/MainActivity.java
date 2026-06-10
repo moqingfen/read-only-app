@@ -1,5 +1,8 @@
 package com.nothingreader.app;
 
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
+import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.Dialog;
 import android.content.ActivityNotFoundException;
@@ -37,13 +40,17 @@ import android.text.TextPaint;
 import android.text.style.BackgroundColorSpan;
 import android.text.style.ForegroundColorSpan;
 import android.util.TypedValue;
+import android.view.DragEvent;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
+import android.view.animation.DecelerateInterpolator;
 import android.view.inputmethod.InputMethodManager;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -56,6 +63,7 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.Space;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -136,6 +144,30 @@ public final class MainActivity extends Activity {
     private String activeSearchQuery = "";
     private int activeSearchOffset = -1;
 
+    private FrameLayout readerReadingFrame;
+    private FrameLayout readerPagesFrame;
+    private LinearLayout pageSurfaceA;
+    private LinearLayout pageSurfaceB;
+    private int readerColumns = 1;
+    private boolean pageAnimating;
+    private boolean pageDragging;
+    private int pageDragDirection;
+    private int pageDragTarget = -1;
+    private boolean webPaged;
+    private int webPageCount = 1;
+    private boolean webDragging;
+    private int webDragBaseX;
+    private float epubPendingChapterProgress = -1.0f;
+    private LinearLayout readerSeekRow;
+    private SeekBar readerSeekBar;
+    private boolean seekTracking;
+    private float seekReturnProgress = -1.0f;
+    private TextView seekBackChip;
+    private int webAnchorIndex = -1;
+    private String webAnchorBookId;
+    private int webAnchorChapter = -1;
+    private static final String WEB_ANCHOR_SELECTOR = "p,h1,h2,h3,h4,h5,h6,li,blockquote,pre,table,img";
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -151,6 +183,72 @@ public final class MainActivity extends Activity {
         installLayoutModeWatcher();
         showShelf();
         showOpeningCover();
+        handleIncomingIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIncomingIntent(intent);
+    }
+
+    private void handleIncomingIntent(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        String action = intent.getAction();
+        Uri uri = null;
+        if (Intent.ACTION_VIEW.equals(action)) {
+            uri = intent.getData();
+        } else if (Intent.ACTION_SEND.equals(action)) {
+            try {
+                if (Build.VERSION.SDK_INT >= 33) {
+                    uri = intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class);
+                } else {
+                    uri = (Uri) intent.getParcelableExtra(Intent.EXTRA_STREAM);
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (uri == null) {
+            return;
+        }
+        importBook(uri);
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (currentBook != null && settings.volumeTurn && event != null) {
+            int code = event.getKeyCode();
+            if (code == KeyEvent.KEYCODE_VOLUME_DOWN || code == KeyEvent.KEYCODE_VOLUME_UP) {
+                if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                    turnCurrentReader(code == KeyEvent.KEYCODE_VOLUME_DOWN ? 1 : -1);
+                }
+                return true;
+            }
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    private void turnCurrentReader(int direction) {
+        if (isPdfBook(currentBook)) {
+            pdfPageTurn(direction);
+        } else if (isEpubBook(currentBook)) {
+            epubPageTurn(direction);
+        } else if (isMarkdownBook(currentBook)) {
+            markdownPageTurn(direction);
+        } else {
+            pageTurn(direction);
+        }
+    }
+
+    private void applyKeepScreenOn(boolean enabled) {
+        if (enabled) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
     }
 
     private void installWindowInsets() {
@@ -330,6 +428,7 @@ public final class MainActivity extends Activity {
         closePdfRenderer();
         closeEpubWebView();
         closeMarkdownWebView();
+        applyKeepScreenOn(false);
         currentBook = null;
         currentContent = null;
         readerScroll = null;
@@ -338,6 +437,25 @@ public final class MainActivity extends Activity {
         readerFooter = null;
         readerChromeVisible = true;
         lazyPagination = false;
+        readerReadingFrame = null;
+        readerPagesFrame = null;
+        pageSurfaceA = null;
+        pageSurfaceB = null;
+        readerColumns = 1;
+        pageAnimating = false;
+        pageDragging = false;
+        webPaged = false;
+        webPageCount = 1;
+        webDragging = false;
+        epubPendingChapterProgress = -1.0f;
+        readerSeekRow = null;
+        readerSeekBar = null;
+        seekTracking = false;
+        seekReturnProgress = -1.0f;
+        seekBackChip = null;
+        webAnchorIndex = -1;
+        webAnchorBookId = null;
+        webAnchorChapter = -1;
         refreshPalette();
         applySystemChrome(palette.background);
         root.setBackgroundColor(palette.background);
@@ -992,6 +1110,14 @@ public final class MainActivity extends Activity {
         showBusy("导入中");
         new Thread(() -> {
             try {
+                Book existing = store.findExisting(uri, books);
+                if (existing != null) {
+                    runOnUiThread(() -> {
+                        toast("已在书架中，直接打开");
+                        openBook(existing);
+                    });
+                    return;
+                }
                 Book book = store.importBook(uri);
                 books.add(book);
                 store.saveBooks(books);
@@ -1130,11 +1256,16 @@ public final class MainActivity extends Activity {
         store.saveBooks(books);
         refreshPalette();
         applySystemChrome(palette.readerBackground);
+        applyKeepScreenOn(true);
         root.setBackgroundColor(palette.readerBackground);
         root.removeAllViews();
         readerToolbar = null;
         readerFooter = null;
+        readerSeekRow = null;
         readerChromeVisible = true;
+        webPaged = settings.pageMode;
+        webPageCount = 1;
+        webDragging = false;
 
         boolean expanded = isExpandedLayout();
         LinearLayout shell = new LinearLayout(this);
@@ -1189,7 +1320,7 @@ public final class MainActivity extends Activity {
         epubWebView.setHorizontalScrollBarEnabled(false);
         epubWebView.setOverScrollMode(View.OVER_SCROLL_NEVER);
         WebSettings webSettings = epubWebView.getSettings();
-        webSettings.setJavaScriptEnabled(false);
+        webSettings.setJavaScriptEnabled(true);
         webSettings.setAllowFileAccess(true);
         webSettings.setAllowContentAccess(false);
         webSettings.setDefaultTextEncodingName("utf-8");
@@ -1204,8 +1335,13 @@ public final class MainActivity extends Activity {
             });
         }
         readingFrame.addView(epubWebView, matchParent());
+        readerReadingFrame = readingFrame;
         attachDocumentSurfaceGesture(epubWebView, this::epubPageTurn);
-        addEpubTurnZones(readingFrame);
+        if (!webPaged) {
+            addEpubTurnZones(readingFrame);
+        }
+
+        shell.addView(buildSeekRow(expanded), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
 
         LinearLayout footer = new LinearLayout(this);
         footer.setGravity(Gravity.CENTER_VERTICAL);
@@ -1214,7 +1350,7 @@ public final class MainActivity extends Activity {
         shell.addView(footer, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)));
         readerFooter = footer;
 
-        TextView previous = smallIconButton("‹", "上一章/上一屏");
+        TextView previous = smallIconButton("‹", "上一章/上一页");
         previous.setOnClickListener(view -> epubPageTurn(-1));
         footer.addView(previous);
         Space leftSpace = new Space(this);
@@ -1223,12 +1359,21 @@ public final class MainActivity extends Activity {
         footer.addView(progressView);
         Space rightSpace = new Space(this);
         footer.addView(rightSpace, new LinearLayout.LayoutParams(0, 1, 1));
-        TextView next = smallIconButton("›", "下一屏/下一章");
+        TextView next = smallIconButton("›", "下一页/下一章");
         next.setOnClickListener(view -> epubPageTurn(1));
         footer.addView(next);
 
+        applyDefaultReaderChrome();
+
+        int anchor = -1;
+        if (webAnchorIndex >= 0
+                && book.id != null
+                && book.id.equals(webAnchorBookId)
+                && webAnchorChapter == epubChapterIndex) {
+            anchor = webAnchorIndex;
+        }
         loadEpubChapter(epubChapterIndex);
-        restoreEpubWebProgress(restoreEpubScroll, 360);
+        restoreWebPosition(epubWebView, restoreEpubScroll, anchor, 380);
     }
 
     private void addEpubTurnZones(FrameLayout readingFrame) {
@@ -1259,36 +1404,192 @@ public final class MainActivity extends Activity {
             String baseUrl = (base == null ? currentEpubDocument.rootDir : base).toURI().toString();
             epubWebView.loadDataWithBaseURL(baseUrl, styled, "text/html", "UTF-8", null);
             epubWebView.postDelayed(() -> {
-                if (epubWebView != null) {
-                    epubWebView.scrollTo(0, 0);
+                if (epubWebView == null) {
+                    return;
+                }
+                epubWebView.scrollTo(0, 0);
+                initWebPagination(epubWebView, () -> {
+                    if (epubWebView == null) {
+                        return;
+                    }
+                    if (epubPendingChapterProgress >= 0.0f) {
+                        float pending = epubPendingChapterProgress;
+                        epubPendingChapterProgress = -1.0f;
+                        scrollWebToChapterProgress(epubWebView, pending);
+                    }
                     updateProgressLabel();
                     saveCurrentProgress();
-                }
-            }, 180);
+                });
+            }, 220);
         } catch (Exception exception) {
             toast(nonEmpty(exception.getMessage(), "章节打开失败"));
         }
     }
 
     private String injectEpubStyle(String html) {
-        String css = "<style>"
-                + "html,body{background:" + colorCss(palette.readerBackground) + ";color:" + colorCss(palette.text) + ";}"
-                + "body{margin:0;padding:" + (isExpandedLayout() ? 34 : 22) + "px " + (isExpandedLayout() ? 76 : 26) + "px " + (isExpandedLayout() ? 34 : 24) + "px;font-family:sans-serif;font-size:" + settings.fontSp + "px;line-height:" + settings.lineMultiplier + ";word-break:break-word;}"
-                + "p{margin:0 0 1.05em 0;text-align:justify;}h1,h2,h3{line-height:1.25;margin:1.2em 0 .7em 0;font-weight:700;}h1{font-size:1.55em;}h2{font-size:1.35em;}h3{font-size:1.18em;}"
-                + "img,svg,video{max-width:100%;height:auto;display:block;margin:1.1em auto;}figure{margin:1.1em 0;text-align:center;}figcaption{font-size:.82em;color:" + colorCss(palette.muted) + ";}"
-                + "blockquote{border-left:3px solid " + colorCss(palette.accent) + ";margin:1em 0;padding:.2em 0 .2em 1em;color:" + colorCss(palette.muted) + ";}"
-                + "ul,ol{padding-left:1.4em;}li{margin:.35em 0;}table{max-width:100%;border-collapse:collapse;}td,th{border:1px solid " + colorCss(palette.hairline) + ";padding:.35em;}"
-                + "a{color:" + colorCss(palette.accent) + ";text-decoration:none;}"
-                + "</style>";
+        String css = "<style>" + readerWebCss(false) + "</style>";
         String value = html == null ? "" : html;
+        value = value.replaceAll("(?is)<script[^>]*>.*?</script>", "");
+        value = value.replaceAll("(?is)<script[^>]*/\\s*>", "");
         if (value.toLowerCase(Locale.US).contains("</head>")) {
-            return value.replaceFirst("(?i)</head>", css + "</head>");
+            return value.replaceFirst("(?i)</head>", java.util.regex.Matcher.quoteReplacement(css) + "</head>");
         }
         return "<html><head>" + css + "</head><body>" + value + "</body></html>";
     }
 
+    private String readerWebCss(boolean markdown) {
+        boolean expanded = isExpandedLayout();
+        int hPad = webPagePaddingHorizontalCssPx();
+        int vPad = expanded ? 30 : 20;
+        int columns = webReaderColumns();
+        StringBuilder css = new StringBuilder();
+        css.append("html,body{background:").append(colorCss(palette.readerBackground)).append(";color:").append(colorCss(palette.text)).append(";}");
+        if (webPaged) {
+            css.append("html{margin:0;padding:0;}");
+            css.append("body{margin:0;box-sizing:border-box;height:100vh;overflow:hidden;")
+                    .append("padding:").append(vPad).append("px ").append(hPad).append("px;")
+                    .append("column-width:calc(").append(100.0f / columns).append("vw - ").append(2 * hPad).append("px);")
+                    .append("column-gap:").append(2 * hPad).append("px;")
+                    .append("column-fill:auto;")
+                    .append("font-family:sans-serif;font-size:").append(settings.fontSp).append("px;line-height:").append(settings.lineMultiplier).append(";word-break:break-word;}");
+            css.append("img,svg,video{max-width:100%;max-height:calc(100vh - ").append(2 * vPad + 16).append("px);height:auto;display:block;margin:1em auto;}");
+        } else {
+            css.append("body{margin:0;padding:").append(vPad).append("px ").append(hPad).append("px ").append(vPad + 8).append("px;")
+                    .append("font-family:sans-serif;font-size:").append(settings.fontSp).append("px;line-height:").append(settings.lineMultiplier).append(";word-break:break-word;}");
+            css.append("img,svg,video{max-width:100%;height:auto;display:block;margin:1.1em auto;}");
+        }
+        css.append("p{margin:0 0 1.05em 0;text-align:justify;}h1,h2,h3,h4,h5,h6{line-height:1.25;margin:1.2em 0 .65em;font-weight:700;}h1{font-size:1.55em;}h2{font-size:1.35em;}h3{font-size:1.18em;}h4,h5,h6{font-size:1.08em;}");
+        css.append("figure{margin:1.1em 0;text-align:center;}figcaption{font-size:.82em;color:").append(colorCss(palette.muted)).append(";}");
+        css.append("blockquote{border-left:3px solid ").append(colorCss(palette.accent)).append(";margin:1em 0;padding:.2em 0 .2em 1em;color:").append(colorCss(palette.muted)).append(";}");
+        css.append("ul,ol{padding-left:1.4em;}li{margin:.35em 0;}");
+        if (markdown) {
+            css.append("pre{background:").append(colorCss(markdownCodeBackground())).append(";border:1px solid ").append(colorCss(palette.hairline)).append(";border-radius:6px;padding:1em;overflow:auto;line-height:1.45;}")
+                    .append("code{font-family:monospace;background:").append(colorCss(markdownCodeBackground())).append(";border-radius:4px;padding:.08em .28em;}pre code{background:transparent;padding:0;}");
+            css.append("table{width:100%;border-collapse:collapse;margin:1em 0;}th,td{border:1px solid ").append(colorCss(palette.hairline)).append(";padding:.48em .55em;text-align:left;}th{font-weight:700;background:").append(colorCss(markdownCodeBackground())).append(";}");
+            css.append("hr{border:0;border-top:1px solid ").append(colorCss(palette.hairline)).append(";margin:1.35em 0;}");
+        } else {
+            css.append("table{max-width:100%;border-collapse:collapse;}td,th{border:1px solid ").append(colorCss(palette.hairline)).append(";padding:.35em;}");
+        }
+        css.append("a{color:").append(colorCss(palette.accent)).append(";text-decoration:none;}");
+        css.append("::selection{background:").append(colorCss(Color.argb(96, 205, 47, 47))).append(";}");
+        return css.toString();
+    }
+
+    private int webPagePaddingHorizontalCssPx() {
+        if (webPaged && webReaderColumns() >= 2) {
+            return 34;
+        }
+        return isExpandedLayout() ? 72 : 22;
+    }
+
+    private int webReaderColumns() {
+        return webPaged && useTwoPageSpread() ? 2 : 1;
+    }
+
+    private void initWebPagination(WebView webView, Runnable then) {
+        if (webView == null) {
+            return;
+        }
+        if (!webPaged) {
+            webPageCount = 1;
+            if (then != null) {
+                then.run();
+            }
+            return;
+        }
+        webView.evaluateJavascript(
+                "(function(){return Math.max(1,Math.round(document.body.scrollWidth/Math.max(1,window.innerWidth)));})()",
+                value -> {
+                    int count = 1;
+                    try {
+                        count = Math.max(1, Math.round(Float.parseFloat(value.trim())));
+                    } catch (Exception ignored) {
+                    }
+                    webPageCount = count;
+                    if (then != null) {
+                        then.run();
+                    }
+                    updateProgressLabel();
+                });
+    }
+
+    private int webCurrentPage(WebView webView) {
+        if (webView == null) {
+            return 0;
+        }
+        int width = Math.max(1, webView.getWidth());
+        return Math.max(0, Math.min(webPageCount - 1, Math.round(webView.getScrollX() / (float) width)));
+    }
+
+    private void scrollWebToChapterProgress(WebView webView, float progress) {
+        if (webView == null) {
+            return;
+        }
+        if (webPaged) {
+            int page = Math.round(clamp(progress) * Math.max(0, webPageCount - 1));
+            webView.scrollTo(page * Math.max(1, webView.getWidth()), 0);
+        } else {
+            int height = Math.max(1, webView.getHeight());
+            int range = Math.max(0, Math.round(webView.getContentHeight() * webView.getScale()) - height);
+            webView.scrollTo(0, Math.round(clamp(progress) * range));
+        }
+        updateProgressLabel();
+    }
+
+    private void animateWebScrollX(WebView webView, int targetX) {
+        if (webView == null) {
+            return;
+        }
+        int startX = webView.getScrollX();
+        if (startX == targetX) {
+            return;
+        }
+        ValueAnimator animator = ValueAnimator.ofInt(startX, targetX);
+        animator.setDuration(220);
+        animator.setInterpolator(new DecelerateInterpolator());
+        animator.addUpdateListener(animation -> {
+            WebView current = epubWebView != null ? epubWebView : markdownWebView;
+            if (current == webView) {
+                webView.scrollTo((Integer) animation.getAnimatedValue(), 0);
+            }
+        });
+        animator.addListener(new AnimatorListenerAdapter() {
+            @Override
+            public void onAnimationEnd(Animator animation) {
+                updateProgressLabel();
+                saveCurrentProgress();
+            }
+        });
+        animator.start();
+    }
+
     private void epubPageTurn(int direction) {
         if (epubWebView == null || currentEpubDocument == null || currentEpubDocument.chapters.isEmpty()) {
+            return;
+        }
+        if (webPaged) {
+            int width = Math.max(1, epubWebView.getWidth());
+            int current = Math.round(epubWebView.getScrollX() / (float) width);
+            int target = current + direction;
+            if (target < 0) {
+                if (epubChapterIndex > 0) {
+                    epubPendingChapterProgress = 1.0f;
+                    loadEpubChapter(epubChapterIndex - 1);
+                } else {
+                    animateWebScrollX(epubWebView, 0);
+                }
+                return;
+            }
+            if (target > webPageCount - 1) {
+                if (epubChapterIndex + 1 < currentEpubDocument.chapters.size()) {
+                    epubPendingChapterProgress = 0.0f;
+                    loadEpubChapter(epubChapterIndex + 1);
+                } else {
+                    animateWebScrollX(epubWebView, (webPageCount - 1) * width);
+                }
+                return;
+            }
+            animateWebScrollX(epubWebView, target * width);
             return;
         }
         int height = Math.max(1, epubWebView.getHeight());
@@ -1312,12 +1613,8 @@ public final class MainActivity extends Activity {
             return;
         }
         if (epubChapterIndex > 0) {
+            epubPendingChapterProgress = 1.0f;
             loadEpubChapter(epubChapterIndex - 1);
-            epubWebView.postDelayed(() -> {
-                if (epubWebView != null) {
-                    epubWebView.scrollTo(0, Math.max(0, Math.round(epubWebView.getContentHeight() * epubWebView.getScale()) - epubWebView.getHeight()));
-                }
-            }, 280);
         }
     }
 
@@ -1374,11 +1671,16 @@ public final class MainActivity extends Activity {
         store.saveBooks(books);
         refreshPalette();
         applySystemChrome(palette.readerBackground);
+        applyKeepScreenOn(true);
         root.setBackgroundColor(palette.readerBackground);
         root.removeAllViews();
         readerToolbar = null;
         readerFooter = null;
+        readerSeekRow = null;
         readerChromeVisible = true;
+        webPaged = settings.pageMode;
+        webPageCount = 1;
+        webDragging = false;
 
         boolean expanded = isExpandedLayout();
         LinearLayout shell = new LinearLayout(this);
@@ -1453,8 +1755,13 @@ public final class MainActivity extends Activity {
             });
         }
         readingFrame.addView(markdownWebView, matchParent());
+        readerReadingFrame = readingFrame;
         attachDocumentSurfaceGesture(markdownWebView, this::markdownPageTurn);
-        addMarkdownTurnZones(readingFrame);
+        if (!webPaged) {
+            addMarkdownTurnZones(readingFrame);
+        }
+
+        shell.addView(buildSeekRow(expanded), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
 
         LinearLayout footer = new LinearLayout(this);
         footer.setGravity(Gravity.CENTER_VERTICAL);
@@ -1463,7 +1770,7 @@ public final class MainActivity extends Activity {
         shell.addView(footer, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)));
         readerFooter = footer;
 
-        TextView previous = smallIconButton("‹", "上一屏");
+        TextView previous = smallIconButton("‹", "上一页");
         previous.setOnClickListener(view -> markdownPageTurn(-1));
         footer.addView(previous);
         Space leftSpace = new Space(this);
@@ -1472,9 +1779,11 @@ public final class MainActivity extends Activity {
         footer.addView(progressView);
         Space rightSpace = new Space(this);
         footer.addView(rightSpace, new LinearLayout.LayoutParams(0, 1, 1));
-        TextView next = smallIconButton("›", "下一屏");
+        TextView next = smallIconButton("›", "下一页");
         next.setOnClickListener(view -> markdownPageTurn(1));
         footer.addView(next);
+
+        applyDefaultReaderChrome();
 
         loadMarkdownDocument(book, content, book.progress);
     }
@@ -1493,7 +1802,11 @@ public final class MainActivity extends Activity {
                         return;
                     }
                     markdownWebView.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null);
-                    restoreMarkdownWebProgress(restoreProgress, 360);
+                    int anchor = -1;
+                    if (webAnchorIndex >= 0 && bookId != null && bookId.equals(webAnchorBookId) && webAnchorChapter < 0) {
+                        anchor = webAnchorIndex;
+                    }
+                    restoreWebPosition(markdownWebView, restoreProgress, anchor, 380);
                     updateProgressLabel();
                 });
             } catch (Exception exception) {
@@ -1507,19 +1820,9 @@ public final class MainActivity extends Activity {
     }
 
     private String markdownHtmlDocument(String body) {
-        int horizontalPadding = isExpandedLayout() ? 74 : 26;
-        int verticalPadding = isExpandedLayout() ? 34 : 24;
         String css = "<style>"
-                + "html,body{background:" + colorCss(palette.readerBackground) + ";color:" + colorCss(palette.text) + ";}"
-                + "body{margin:0;padding:" + verticalPadding + "px " + horizontalPadding + "px " + (verticalPadding + 8) + "px;font-family:sans-serif;font-size:" + settings.fontSp + "px;line-height:" + settings.lineMultiplier + ";word-break:break-word;}"
-                + "main{max-width:880px;margin:0 auto;}"
-                + "p{margin:0 0 1.05em 0;text-align:justify;}h1,h2,h3,h4,h5,h6{line-height:1.25;margin:1.25em 0 .65em;font-weight:700;}h1{font-size:1.7em;}h2{font-size:1.42em;}h3{font-size:1.22em;}h4,h5,h6{font-size:1.08em;}"
-                + "img{max-width:100%;height:auto;display:block;margin:1.1em auto;}figure{margin:1.1em 0;text-align:center;}figcaption{font-size:.82em;color:" + colorCss(palette.muted) + ";margin-top:.45em;}"
-                + "blockquote{border-left:3px solid " + colorCss(palette.accent) + ";margin:1em 0;padding:.15em 0 .15em 1em;color:" + colorCss(palette.muted) + ";}"
-                + "pre{background:" + colorCss(markdownCodeBackground()) + ";border:1px solid " + colorCss(palette.hairline) + ";border-radius:6px;padding:1em;overflow:auto;line-height:1.45;}code{font-family:monospace;background:" + colorCss(markdownCodeBackground()) + ";border-radius:4px;padding:.08em .28em;}pre code{background:transparent;padding:0;}"
-                + "ul,ol{padding-left:1.45em;margin:.4em 0 1em;}li{margin:.36em 0;}"
-                + "table{width:100%;border-collapse:collapse;margin:1em 0;display:block;overflow-x:auto;}th,td{border:1px solid " + colorCss(palette.hairline) + ";padding:.48em .55em;text-align:left;}th{font-weight:700;background:" + colorCss(markdownCodeBackground()) + ";}"
-                + "hr{border:0;border-top:1px solid " + colorCss(palette.hairline) + ";margin:1.35em 0;}a{color:" + colorCss(palette.accent) + ";text-decoration:none;}::selection{background:" + colorCss(Color.argb(96, 205, 47, 47)) + ";}"
+                + readerWebCss(true)
+                + (webPaged ? "" : "main{max-width:880px;margin:0 auto;}")
                 + "</style>";
         return "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" + css + "</head><body><main>" + body + "</main></body></html>";
     }
@@ -1573,6 +1876,9 @@ public final class MainActivity extends Activity {
 
     private void attachDocumentSurfaceGesture(View view, PageTurnHandler handler) {
         view.setOnTouchListener((target, event) -> {
+            if (webPaged && target instanceof WebView) {
+                return handlePagedWebTouch((WebView) target, event, handler);
+            }
             if (event.getAction() == MotionEvent.ACTION_DOWN) {
                 touchDownX = event.getX();
                 touchDownY = event.getY();
@@ -1594,6 +1900,67 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private boolean handlePagedWebTouch(WebView webView, MotionEvent event, PageTurnHandler handler) {
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN: {
+                touchDownX = event.getX();
+                touchDownY = event.getY();
+                webDragBaseX = webView.getScrollX();
+                webDragging = false;
+                return true;
+            }
+            case MotionEvent.ACTION_MOVE: {
+                float dx = event.getX() - touchDownX;
+                float dy = event.getY() - touchDownY;
+                if (!webDragging && Math.abs(dx) > dp(14) && Math.abs(dx) > Math.abs(dy) * 1.2f) {
+                    webDragging = true;
+                }
+                if (webDragging) {
+                    int width = Math.max(1, webView.getWidth());
+                    int maxX = Math.max(0, (webPageCount - 1) * width);
+                    int targetX = Math.max(0, Math.min(maxX, webDragBaseX - Math.round(dx)));
+                    webView.scrollTo(targetX, 0);
+                }
+                return true;
+            }
+            case MotionEvent.ACTION_UP: {
+                float dx = event.getX() - touchDownX;
+                float dy = event.getY() - touchDownY;
+                if (webDragging) {
+                    webDragging = false;
+                    int width = Math.max(1, webView.getWidth());
+                    int basePage = Math.round(webDragBaseX / (float) width);
+                    int targetPage = basePage;
+                    if (dx < -dp(46)) {
+                        targetPage = basePage + 1;
+                    } else if (dx > dp(46)) {
+                        targetPage = basePage - 1;
+                    }
+                    if (targetPage < 0 || targetPage > webPageCount - 1) {
+                        handler.turn(targetPage < 0 ? -1 : 1);
+                    } else {
+                        animateWebScrollX(webView, targetPage * width);
+                    }
+                    return true;
+                }
+                if (Math.abs(dx) < dp(18) && Math.abs(dy) < dp(18)) {
+                    turnOrToggleByHorizontalZone(webView.getWidth(), event.getX(), handler);
+                }
+                return true;
+            }
+            case MotionEvent.ACTION_CANCEL: {
+                if (webDragging) {
+                    webDragging = false;
+                    int width = Math.max(1, webView.getWidth());
+                    animateWebScrollX(webView, webCurrentPage(webView) * width);
+                }
+                return true;
+            }
+            default:
+                return true;
+        }
+    }
+
     private void turnOrToggleByHorizontalZone(int width, float x, PageTurnHandler handler) {
         int safeWidth = Math.max(1, width);
         if (x < safeWidth * 0.34f) {
@@ -1607,6 +1974,13 @@ public final class MainActivity extends Activity {
 
     private void markdownPageTurn(int direction) {
         if (markdownWebView == null) {
+            return;
+        }
+        if (webPaged) {
+            int width = Math.max(1, markdownWebView.getWidth());
+            int current = Math.round(markdownWebView.getScrollX() / (float) width);
+            int target = Math.max(0, Math.min(webPageCount - 1, current + direction));
+            animateWebScrollX(markdownWebView, target * width);
             return;
         }
         int height = Math.max(1, markdownWebView.getHeight());
@@ -1627,29 +2001,110 @@ public final class MainActivity extends Activity {
     }
 
     private float markdownWebProgress() {
-        if (markdownWebView == null) {
+        return webContentProgress(markdownWebView);
+    }
+
+    private float webContentProgress(WebView webView) {
+        if (webView == null) {
             return 0.0f;
         }
-        int height = Math.max(1, markdownWebView.getHeight());
-        int range = Math.max(1, Math.round(markdownWebView.getContentHeight() * markdownWebView.getScale()) - height);
-        return clamp(markdownWebView.getScrollY() / (float) range);
+        if (webPaged) {
+            int width = Math.max(1, webView.getWidth());
+            int range = Math.max(0, (webPageCount - 1) * width);
+            if (range <= 0) {
+                return 0.0f;
+            }
+            return clamp(webView.getScrollX() / (float) range);
+        }
+        int height = Math.max(1, webView.getHeight());
+        int range = Math.max(1, Math.round(webView.getContentHeight() * webView.getScale()) - height);
+        return clamp(webView.getScrollY() / (float) range);
     }
 
     private void restoreMarkdownWebProgress(float progress, int delayMillis) {
-        if (markdownWebView == null) {
+        restoreWebPosition(markdownWebView, progress, -1, delayMillis);
+    }
+
+    private void restoreWebPosition(WebView webView, float progress, int anchorIndex, int delayMillis) {
+        if (webView == null) {
             return;
         }
         float safeProgress = clamp(progress);
-        markdownWebView.postDelayed(() -> {
-            if (markdownWebView == null) {
+        webView.postDelayed(() -> {
+            WebView current = epubWebView != null ? epubWebView : markdownWebView;
+            if (current != webView) {
                 return;
             }
-            int height = Math.max(1, markdownWebView.getHeight());
-            int range = Math.max(0, Math.round(markdownWebView.getContentHeight() * markdownWebView.getScale()) - height);
-            markdownWebView.scrollTo(0, Math.round(safeProgress * range));
-            updateProgressLabel();
-            saveCurrentProgress();
+            initWebPagination(webView, () -> {
+                if (anchorIndex >= 0) {
+                    restoreWebByAnchor(webView, anchorIndex, safeProgress);
+                } else {
+                    scrollWebToChapterProgress(webView, safeProgress);
+                }
+                updateProgressLabel();
+                saveCurrentProgress();
+            });
         }, delayMillis);
+    }
+
+    private void restoreWebByAnchor(WebView webView, int anchorIndex, float fallbackProgress) {
+        String js;
+        if (webPaged) {
+            js = "(function(){var els=document.querySelectorAll('" + WEB_ANCHOR_SELECTOR + "');"
+                    + "if(" + anchorIndex + ">=els.length)return -1;"
+                    + "var r=els[" + anchorIndex + "].getBoundingClientRect();"
+                    + "return Math.max(0,Math.floor((r.left+(window.scrollX||0)+2)/Math.max(1,window.innerWidth)));})()";
+        } else {
+            js = "(function(){var els=document.querySelectorAll('" + WEB_ANCHOR_SELECTOR + "');"
+                    + "if(" + anchorIndex + ">=els.length)return -1;"
+                    + "var r=els[" + anchorIndex + "].getBoundingClientRect();"
+                    + "return Math.max(0,Math.round(r.top+(window.scrollY||0)));})()";
+        }
+        webView.evaluateJavascript(js, value -> {
+            WebView current = epubWebView != null ? epubWebView : markdownWebView;
+            if (current != webView) {
+                return;
+            }
+            int parsed = -1;
+            try {
+                parsed = Math.round(Float.parseFloat(value.trim()));
+            } catch (Exception ignored) {
+            }
+            if (parsed < 0) {
+                scrollWebToChapterProgress(webView, fallbackProgress);
+                return;
+            }
+            if (webPaged) {
+                int page = Math.max(0, Math.min(webPageCount - 1, parsed));
+                webView.scrollTo(page * Math.max(1, webView.getWidth()), 0);
+            } else {
+                webView.scrollTo(0, Math.max(0, Math.round(parsed * webView.getScale()) - dp(8)));
+            }
+            updateProgressLabel();
+        });
+    }
+
+    private void captureWebAnchor() {
+        WebView webView = epubWebView != null ? epubWebView : markdownWebView;
+        if (webView == null || currentBook == null) {
+            return;
+        }
+        String bookId = currentBook.id;
+        int chapter = epubWebView != null ? epubChapterIndex : -1;
+        String js = "(function(){var els=document.querySelectorAll('" + WEB_ANCHOR_SELECTOR + "');"
+                + "for(var i=0;i<els.length;i++){var r=els[i].getBoundingClientRect();"
+                + "if((r.width>0||r.height>0)&&r.right>2&&r.bottom>2){return i;}}return -1;})()";
+        webView.evaluateJavascript(js, value -> {
+            try {
+                int index = Math.round(Float.parseFloat(value.trim()));
+                if (index >= 0) {
+                    webAnchorIndex = index;
+                    webAnchorBookId = bookId;
+                    webAnchorChapter = chapter;
+                }
+            } catch (Exception ignored) {
+            }
+        });
     }
 
     private void closeMarkdownWebView() {
@@ -1697,6 +2152,9 @@ public final class MainActivity extends Activity {
         pdfPageIndex = Math.max(0, Math.min(pdfPageCount - 1, Math.round(clamp(book.progress) * Math.max(0, pdfPageCount - 1))));
         book.lastOpenedAt = System.currentTimeMillis();
         store.saveBooks(books);
+        applyKeepScreenOn(true);
+        readerSeekRow = null;
+        webPaged = false;
 
         boolean expanded = isExpandedLayout();
         LinearLayout shell = new LinearLayout(this);
@@ -1789,6 +2247,9 @@ public final class MainActivity extends Activity {
         pdfImage.setBackgroundColor(Color.WHITE);
         pdfPageHolder.addView(pdfImage, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL));
 
+        readerReadingFrame = readingFrame;
+        shell.addView(buildSeekRow(expanded), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
+
         LinearLayout footer = new LinearLayout(this);
         footer.setGravity(Gravity.CENTER_VERTICAL);
         footer.setPadding(expanded ? dp(28) : dp(18), dp(2), expanded ? dp(28) : dp(18), dp(10));
@@ -1810,6 +2271,8 @@ public final class MainActivity extends Activity {
         TextView next = smallIconButton("›", "下一页");
         next.setOnClickListener(view -> pdfPageTurn(1));
         footer.addView(next);
+
+        applyDefaultReaderChrome();
 
         pdfImage.post(this::renderPdfPage);
         updateProgressLabel();
@@ -2005,11 +2468,16 @@ public final class MainActivity extends Activity {
         store.saveBooks(books);
         refreshPalette();
         applySystemChrome(palette.readerBackground);
+        applyKeepScreenOn(true);
         root.setBackgroundColor(palette.readerBackground);
         root.removeAllViews();
         readerToolbar = null;
         readerFooter = null;
+        readerSeekRow = null;
         readerChromeVisible = true;
+        webPaged = false;
+        pageAnimating = false;
+        pageDragging = false;
 
         boolean expanded = isExpandedLayout();
         LinearLayout shell = new LinearLayout(this);
@@ -2072,17 +2540,26 @@ public final class MainActivity extends Activity {
 
         FrameLayout readingFrame = new FrameLayout(this);
         page.addView(readingFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        readerReadingFrame = readingFrame;
 
         if (settings.pageMode) {
             readerScroll = null;
-            readerText = text("", settings.fontSp, palette.text, Typeface.NORMAL);
-            readerText.setPadding(expanded ? dp(76) : dp(26), expanded ? dp(32) : dp(20), expanded ? dp(76) : dp(26), expanded ? dp(28) : dp(22));
-            readerText.setGravity(Gravity.TOP);
-            readerText.setTextIsSelectable(false);
+            readerColumns = useTwoPageSpread() ? 2 : 1;
+            readerPagesFrame = new FrameLayout(this);
+            readingFrame.addView(readerPagesFrame, matchParent());
+            pageSurfaceB = buildPageSurface(expanded, readerColumns);
+            pageSurfaceB.setVisibility(View.INVISIBLE);
+            readerPagesFrame.addView(pageSurfaceB, matchParent());
+            pageSurfaceA = buildPageSurface(expanded, readerColumns);
+            readerPagesFrame.addView(pageSurfaceA, matchParent());
+            readerText = surfaceColumn(pageSurfaceA, 0);
             applyReaderTextStyle();
-            readingFrame.addView(readerText, matchParent());
             addPageTurnZones(readingFrame);
         } else {
+            readerColumns = 1;
+            readerPagesFrame = null;
+            pageSurfaceA = null;
+            pageSurfaceB = null;
             readerScroll = new ScrollView(this);
             readerScroll.setFillViewport(false);
             readerScroll.setClipToPadding(false);
@@ -2101,6 +2578,8 @@ public final class MainActivity extends Activity {
             readerScroll.addView(textFrame, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
             textFrame.addView(readerText, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL));
         }
+
+        page.addView(buildSeekRow(expanded), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
 
         LinearLayout footer = new LinearLayout(this);
         footer.setGravity(Gravity.CENTER_VERTICAL);
@@ -2128,6 +2607,8 @@ public final class MainActivity extends Activity {
             footer.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1));
             footer.addView(text(content.chapters.size() + " 章", 12, palette.muted, Typeface.NORMAL));
         }
+
+        applyDefaultReaderChrome();
 
         if (settings.pageMode) {
             int finalRestoreOffset = restoreOffset;
@@ -2162,6 +2643,98 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void applyDefaultReaderChrome() {
+        setReaderChromeVisible(readerChromeVisible);
+    }
+
+    private void setReaderChromeVisible(boolean visible) {
+        readerChromeVisible = visible;
+        int visibility = visible ? View.VISIBLE : View.GONE;
+        if (readerToolbar != null) {
+            readerToolbar.setVisibility(visibility);
+        }
+        if (readerFooter != null) {
+            readerFooter.setVisibility(visibility);
+        }
+        if (readerSeekRow != null) {
+            readerSeekRow.setVisibility(visibility);
+        }
+    }
+
+    private LinearLayout buildSeekRow(boolean expanded) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(expanded ? dp(24) : dp(14), 0, expanded ? dp(24) : dp(14), 0);
+        row.setBackgroundColor(palette.readerBackground);
+
+        SeekBar bar = new SeekBar(this);
+        bar.setMax(1000);
+        bar.setProgress(Math.round(clamp(currentBook == null ? 0.0f : currentBook.progress) * 1000));
+        try {
+            bar.getProgressDrawable().setColorFilter(palette.accent, PorterDuff.Mode.SRC_IN);
+            if (bar.getThumb() != null) {
+                bar.getThumb().setColorFilter(palette.accent, PorterDuff.Mode.SRC_IN);
+            }
+        } catch (Exception ignored) {
+        }
+        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+                seekTracking = true;
+                seekReturnProgress = currentScrollProgress();
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                seekTracking = false;
+                float target = seekBar.getProgress() / 1000.0f;
+                scrollToProgress(target, false);
+                showSeekBackChip();
+            }
+        });
+        readerSeekBar = bar;
+        row.addView(bar, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        readerSeekRow = row;
+        return row;
+    }
+
+    private void showSeekBackChip() {
+        if (readerReadingFrame == null || seekReturnProgress < 0.0f) {
+            return;
+        }
+        removeSeekBackChip();
+        TextView chip = pill("回到 " + Math.round(clamp(seekReturnProgress) * 100) + "%", true);
+        chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        chip.setPadding(dp(16), dp(9), dp(16), dp(9));
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        params.setMargins(0, 0, 0, dp(18));
+        chip.setOnClickListener(view -> {
+            float back = seekReturnProgress;
+            seekReturnProgress = -1.0f;
+            removeSeekBackChip();
+            if (back >= 0.0f) {
+                scrollToProgress(back, false);
+            }
+        });
+        readerReadingFrame.addView(chip, params);
+        seekBackChip = chip;
+        handler.postDelayed(this::removeSeekBackChip, 10000);
+    }
+
+    private void removeSeekBackChip() {
+        if (seekBackChip != null && seekBackChip.getParent() instanceof ViewGroup) {
+            ((ViewGroup) seekBackChip.getParent()).removeView(seekBackChip);
+        }
+        seekBackChip = null;
+    }
+
     private void toggleReaderChrome() {
         if (readerToolbar == null || readerFooter == null) {
             return;
@@ -2169,11 +2742,8 @@ public final class MainActivity extends Activity {
         int restoreOffset = currentVisibleOffset();
         float epubProgress = isEpubBook(currentBook) && currentEpubDocument != null ? epubWebProgress() : -1.0f;
         float markdownProgress = isMarkdownBook(currentBook) ? markdownWebProgress() : -1.0f;
-        readerChromeVisible = !readerChromeVisible;
-        int visibility = readerChromeVisible ? View.VISIBLE : View.GONE;
-        readerToolbar.setVisibility(visibility);
-        readerFooter.setVisibility(visibility);
-        if (settings.pageMode && currentBook != null && currentContent != null && readerText != null) {
+        setReaderChromeVisible(!readerChromeVisible);
+        if (settings.pageMode && currentBook != null && currentContent != null && readerText != null && !isEpubBook(currentBook) && !isMarkdownBook(currentBook)) {
             readerText.postDelayed(() -> buildPagesForCurrentLayout(currentBook.progress, restoreOffset), 80);
         } else if (epubProgress >= 0.0f) {
             restoreEpubWebProgress(epubProgress, 90);
@@ -2200,26 +2770,175 @@ public final class MainActivity extends Activity {
         attachPageGesture(next, 1);
         FrameLayout.LayoutParams nextParams = new FrameLayout.LayoutParams(dp(isExpandedLayout() ? 260 : 172), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.RIGHT);
         readingFrame.addView(next, nextParams);
-        attachPageGesture(readerText, 0);
+        if (readerPagesFrame != null) {
+            attachPageGesture(readerPagesFrame, 0);
+        } else {
+            attachPageGesture(readerText, 0);
+        }
+    }
+
+    private boolean useTwoPageSpread() {
+        // v0.3 折叠屏展开态启用双页对开；v0.2 保持单页。
+        return false;
+    }
+
+    private LinearLayout buildPageSurface(boolean expanded, int columns) {
+        LinearLayout surface = new LinearLayout(this);
+        surface.setOrientation(LinearLayout.HORIZONTAL);
+        surface.setBackgroundColor(palette.readerBackground);
+        int outer = columns >= 2 ? dp(44) : (expanded ? dp(76) : dp(24));
+        surface.setPadding(outer, 0, outer, 0);
+        int vTop = expanded ? dp(32) : dp(20);
+        int vBottom = expanded ? dp(28) : dp(22);
+        for (int i = 0; i < columns; i++) {
+            if (i > 0) {
+                Space gap = new Space(this);
+                surface.addView(gap, new LinearLayout.LayoutParams(dp(56), ViewGroup.LayoutParams.MATCH_PARENT));
+            }
+            TextView column = text("", settings.fontSp, palette.text, Typeface.NORMAL);
+            column.setPadding(0, vTop, 0, vBottom);
+            column.setGravity(Gravity.TOP);
+            column.setTextIsSelectable(false);
+            surface.addView(column, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1));
+        }
+        return surface;
+    }
+
+    private TextView surfaceColumn(LinearLayout surface, int index) {
+        if (surface == null) {
+            return null;
+        }
+        int seen = 0;
+        for (int i = 0; i < surface.getChildCount(); i++) {
+            View child = surface.getChildAt(i);
+            if (child instanceof TextView) {
+                if (seen == index) {
+                    return (TextView) child;
+                }
+                seen++;
+            }
+        }
+        return null;
+    }
+
+    private void renderSurfacePages(LinearLayout surface, int basePage) {
+        if (surface == null || currentContent == null) {
+            return;
+        }
+        String text = currentContent.fullText == null ? "" : currentContent.fullText;
+        if (pageStarts.isEmpty()) {
+            pageStarts.add(0);
+        }
+        if (lazyPagination) {
+            ensureLazyPagesThrough(basePage + readerColumns - 1);
+        }
+        for (int j = 0; j < readerColumns; j++) {
+            TextView column = surfaceColumn(surface, j);
+            if (column == null) {
+                continue;
+            }
+            int pageNumber = basePage + j;
+            if (pageNumber < 0 || pageNumber >= pageStarts.size()) {
+                column.setText("");
+                continue;
+            }
+            int start = pageStarts.get(pageNumber);
+            int end;
+            if (lazyPagination) {
+                end = lazyPageEndAt(text, pageNumber);
+            } else {
+                end = pageNumber + 1 < pageStarts.size() ? pageStarts.get(pageNumber + 1) : text.length();
+            }
+            if (start >= end) {
+                column.setText("");
+                continue;
+            }
+            setColumnTextWithHighlight(column, text.substring(Math.max(0, start), Math.max(start, end)), start);
+        }
+    }
+
+    private void animatePageCommit(int target, int direction) {
+        if (readerPagesFrame == null || pageSurfaceA == null || pageSurfaceB == null
+                || readerPagesFrame.getWidth() <= 0) {
+            pageIndex = target;
+            renderCurrentPage();
+            saveCurrentProgress();
+            return;
+        }
+        int width = readerPagesFrame.getWidth();
+        renderSurfacePages(pageSurfaceB, target);
+        pageSurfaceB.setVisibility(View.VISIBLE);
+        pageSurfaceB.setTranslationX(direction * width);
+        pageAnimating = true;
+        pageSurfaceA.animate()
+                .translationX(-direction * width)
+                .setDuration(240)
+                .setInterpolator(new DecelerateInterpolator())
+                .start();
+        pageSurfaceB.animate()
+                .translationX(0)
+                .setDuration(240)
+                .setInterpolator(new DecelerateInterpolator())
+                .withEndAction(() -> commitPageSurface(target))
+                .start();
+    }
+
+    private void commitPageSurface(int target) {
+        pageIndex = target;
+        swapPageSurfaces();
+        pageAnimating = false;
+        renderCurrentPage();
+        saveCurrentProgress();
+    }
+
+    private void swapPageSurfaces() {
+        LinearLayout swap = pageSurfaceA;
+        pageSurfaceA = pageSurfaceB;
+        pageSurfaceB = swap;
+        if (pageSurfaceB != null) {
+            pageSurfaceB.setVisibility(View.INVISIBLE);
+            pageSurfaceB.setTranslationX(0);
+        }
+        if (pageSurfaceA != null) {
+            pageSurfaceA.setVisibility(View.VISIBLE);
+            pageSurfaceA.setTranslationX(0);
+        }
+        readerText = surfaceColumn(pageSurfaceA, 0);
+    }
+
+    private void ensureLazyPagesThrough(int targetIndex) {
+        if (!lazyPagination || currentContent == null || currentContent.fullText == null || pageStarts.isEmpty()) {
+            return;
+        }
+        String text = currentContent.fullText;
+        int guard = 0;
+        while (pageStarts.size() <= targetIndex && guard < 12) {
+            int lastStart = pageStarts.get(pageStarts.size() - 1);
+            int next = measuredPageBreak(text, lastStart, lazyContentWidth, lazyContentHeight, lazyEstimatedChars);
+            next = skipPageBreakWhitespace(text, next);
+            if (next <= lastStart || next >= text.length()) {
+                break;
+            }
+            pageStarts.add(next);
+            guard++;
+        }
     }
 
     private void pageTurn(int direction) {
         if (settings.pageMode) {
-            if (pageStarts.isEmpty()) {
+            if (pageStarts.isEmpty() || pageAnimating || pageDragging) {
                 return;
             }
             if (lazyPagination) {
                 if (direction > 0) {
-                    ensureNextLazyPage();
+                    ensureLazyPagesThrough(pageIndex + 2 * readerColumns);
                 } else if (direction < 0) {
                     ensurePreviousLazyPage();
                 }
             }
-            int target = Math.max(0, Math.min(pageStarts.size() - 1, pageIndex + direction));
+            int target = Math.max(0, Math.min(pageStarts.size() - 1, pageIndex + direction * readerColumns));
             if (target != pageIndex) {
-                pageIndex = target;
-                renderCurrentPage();
-                saveCurrentProgress();
+                animatePageCommit(target, direction);
             }
             return;
         }
@@ -2242,37 +2961,149 @@ public final class MainActivity extends Activity {
             if (!settings.pageMode) {
                 return false;
             }
-            if (event.getAction() == MotionEvent.ACTION_DOWN) {
-                touchDownX = event.getX();
-                touchDownY = event.getY();
-                return true;
-            }
-            if (event.getAction() == MotionEvent.ACTION_UP) {
-                float dx = event.getX() - touchDownX;
-                float dy = event.getY() - touchDownY;
-                if (Math.abs(dx) > dp(46) && Math.abs(dx) > Math.abs(dy) * 1.2f) {
-                    pageTurn(dx < 0 ? 1 : -1);
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN: {
+                    touchDownX = event.getX();
+                    touchDownY = event.getY();
                     return true;
                 }
-                if (Math.abs(dx) < dp(18) && Math.abs(dy) < dp(18)) {
-                    if (tapDirection != 0) {
-                        pageTurn(tapDirection);
+                case MotionEvent.ACTION_MOVE: {
+                    if (pageAnimating) {
                         return true;
                     }
-                    int width = Math.max(1, target.getWidth());
-                    float x = event.getX();
-                    if (x < width * 0.34f) {
-                        pageTurn(-1);
-                    } else if (x > width * 0.66f) {
-                        pageTurn(1);
-                    } else {
-                        toggleReaderChrome();
+                    float dx = event.getX() - touchDownX;
+                    float dy = event.getY() - touchDownY;
+                    if (!pageDragging && Math.abs(dx) > dp(14) && Math.abs(dx) > Math.abs(dy) * 1.2f) {
+                        startPageDrag(dx < 0 ? 1 : -1);
+                    }
+                    if (pageDragging) {
+                        updatePageDrag(dx);
                     }
                     return true;
                 }
+                case MotionEvent.ACTION_UP: {
+                    float dx = event.getX() - touchDownX;
+                    float dy = event.getY() - touchDownY;
+                    if (pageDragging) {
+                        finishPageDrag(dx);
+                        return true;
+                    }
+                    if (pageAnimating) {
+                        return true;
+                    }
+                    if (Math.abs(dx) > dp(46) && Math.abs(dx) > Math.abs(dy) * 1.2f) {
+                        pageTurn(dx < 0 ? 1 : -1);
+                        return true;
+                    }
+                    if (Math.abs(dx) < dp(18) && Math.abs(dy) < dp(18)) {
+                        if (tapDirection != 0) {
+                            pageTurn(tapDirection);
+                            return true;
+                        }
+                        int width = Math.max(1, target.getWidth());
+                        float x = event.getX();
+                        if (x < width * 0.34f) {
+                            pageTurn(-1);
+                        } else if (x > width * 0.66f) {
+                            pageTurn(1);
+                        } else {
+                            toggleReaderChrome();
+                        }
+                        return true;
+                    }
+                    return true;
+                }
+                case MotionEvent.ACTION_CANCEL: {
+                    if (pageDragging) {
+                        finishPageDrag(0);
+                    }
+                    return true;
+                }
+                default:
+                    return true;
             }
-            return true;
         });
+    }
+
+    private void startPageDrag(int direction) {
+        if (readerPagesFrame == null || pageSurfaceA == null || pageSurfaceB == null
+                || readerPagesFrame.getWidth() <= 0 || pageStarts.isEmpty()) {
+            return;
+        }
+        if (lazyPagination) {
+            if (direction > 0) {
+                ensureLazyPagesThrough(pageIndex + 2 * readerColumns);
+            } else {
+                ensurePreviousLazyPage();
+            }
+        }
+        int target = Math.max(0, Math.min(pageStarts.size() - 1, pageIndex + direction * readerColumns));
+        if (target == pageIndex) {
+            return;
+        }
+        pageDragDirection = direction;
+        pageDragTarget = target;
+        renderSurfacePages(pageSurfaceB, target);
+        pageSurfaceB.setVisibility(View.VISIBLE);
+        pageSurfaceB.setTranslationX(direction * readerPagesFrame.getWidth());
+        pageDragging = true;
+    }
+
+    private void updatePageDrag(float dx) {
+        if (readerPagesFrame == null || pageSurfaceA == null || pageSurfaceB == null) {
+            return;
+        }
+        int width = Math.max(1, readerPagesFrame.getWidth());
+        float clamped = pageDragDirection > 0
+                ? Math.max(-width, Math.min(0, dx))
+                : Math.min(width, Math.max(0, dx));
+        pageSurfaceA.setTranslationX(clamped);
+        pageSurfaceB.setTranslationX(pageDragDirection * width + clamped);
+    }
+
+    private void finishPageDrag(float dx) {
+        pageDragging = false;
+        if (readerPagesFrame == null || pageSurfaceA == null || pageSurfaceB == null) {
+            return;
+        }
+        int width = Math.max(1, readerPagesFrame.getWidth());
+        float clamped = pageDragDirection > 0
+                ? Math.max(-width, Math.min(0, dx))
+                : Math.min(width, Math.max(0, dx));
+        boolean commit = Math.abs(clamped) > Math.min(dp(64), width * 0.22f);
+        pageAnimating = true;
+        if (commit) {
+            int target = pageDragTarget;
+            pageSurfaceA.animate()
+                    .translationX(-pageDragDirection * width)
+                    .setDuration(200)
+                    .setInterpolator(new DecelerateInterpolator())
+                    .start();
+            pageSurfaceB.animate()
+                    .translationX(0)
+                    .setDuration(200)
+                    .setInterpolator(new DecelerateInterpolator())
+                    .withEndAction(() -> commitPageSurface(target))
+                    .start();
+        } else {
+            pageSurfaceA.animate()
+                    .translationX(0)
+                    .setDuration(180)
+                    .setInterpolator(new DecelerateInterpolator())
+                    .start();
+            pageSurfaceB.animate()
+                    .translationX(pageDragDirection * width)
+                    .setDuration(180)
+                    .setInterpolator(new DecelerateInterpolator())
+                    .withEndAction(() -> {
+                        if (pageSurfaceB != null) {
+                            pageSurfaceB.setVisibility(View.INVISIBLE);
+                            pageSurfaceB.setTranslationX(0);
+                        }
+                        pageAnimating = false;
+                    })
+                    .start();
+        }
     }
 
     private void buildPagesForCurrentLayout(float progress, int restoreOffset) {
@@ -2339,40 +3170,24 @@ public final class MainActivity extends Activity {
         return estimatedPages > 900;
     }
 
-    private void ensureNextLazyPage() {
-        if (!lazyPagination || currentContent == null || currentContent.fullText == null || pageStarts.isEmpty()) {
-            return;
-        }
-        String text = currentContent.fullText;
-        int start = pageStarts.get(Math.max(0, Math.min(pageIndex, pageStarts.size() - 1)));
-        int next = measuredPageBreak(text, start, lazyContentWidth, lazyContentHeight, lazyEstimatedChars);
-        next = skipPageBreakWhitespace(text, next);
-        if (next > start && next < text.length()) {
-            int insertAt = pageIndex + 1;
-            if (insertAt >= pageStarts.size()) {
-                pageStarts.add(next);
-            } else if (!pageStarts.get(insertAt).equals(next)) {
-                pageStarts.add(insertAt, next);
-            }
-        }
-    }
-
     private void ensurePreviousLazyPage() {
         if (!lazyPagination || currentContent == null || currentContent.fullText == null || pageStarts.isEmpty()) {
             return;
         }
-        if (pageIndex > 0) {
-            return;
-        }
         String text = currentContent.fullText;
-        int currentStart = pageStarts.get(0);
-        if (currentStart <= 0) {
-            return;
-        }
-        int previous = previousLazyPageStart(text, currentStart);
-        if (previous >= 0 && previous < currentStart) {
+        int guard = 0;
+        while (pageIndex < readerColumns && guard < 8) {
+            int currentStart = pageStarts.get(0);
+            if (currentStart <= 0) {
+                return;
+            }
+            int previous = previousLazyPageStart(text, currentStart);
+            if (previous < 0 || previous >= currentStart) {
+                return;
+            }
             pageStarts.add(0, previous);
-            pageIndex = 1;
+            pageIndex++;
+            guard++;
         }
     }
 
@@ -2522,32 +3337,40 @@ public final class MainActivity extends Activity {
     }
 
     private void renderCurrentPage() {
-        if (readerText == null || currentContent == null) {
+        if (currentContent == null) {
             return;
         }
-        String text = currentContent.fullText == null ? "" : currentContent.fullText;
         if (pageStarts.isEmpty()) {
             pageStarts.add(0);
         }
         pageIndex = Math.max(0, Math.min(pageIndex, pageStarts.size() - 1));
-        int start = pageStarts.get(pageIndex);
-        int end;
-        if (lazyPagination) {
-            end = lazyPageEnd(text, start);
-        } else {
-            end = pageIndex + 1 < pageStarts.size() ? pageStarts.get(pageIndex + 1) : text.length();
+        if (pageSurfaceA != null) {
+            renderSurfacePages(pageSurfaceA, pageIndex);
+            updateProgressLabel();
+            return;
         }
-        setReaderTextWithHighlight(text.substring(Math.max(0, start), Math.max(start, end)), start);
-        updateProgressLabel();
-    }
-
-    private void setReaderTextWithHighlight(String value, int globalStart) {
-        String display = trimPageDisplayText(value);
         if (readerText == null) {
             return;
         }
+        String text = currentContent.fullText == null ? "" : currentContent.fullText;
+        int start = pageStarts.get(pageIndex);
+        int end;
+        if (lazyPagination) {
+            end = lazyPageEndAt(text, pageIndex);
+        } else {
+            end = pageIndex + 1 < pageStarts.size() ? pageStarts.get(pageIndex + 1) : text.length();
+        }
+        setColumnTextWithHighlight(readerText, text.substring(Math.max(0, start), Math.max(start, end)), start);
+        updateProgressLabel();
+    }
+
+    private void setColumnTextWithHighlight(TextView column, String value, int globalStart) {
+        String display = trimPageDisplayText(value);
+        if (column == null) {
+            return;
+        }
         if (activeSearchQuery == null || activeSearchQuery.trim().isEmpty()) {
-            readerText.setText(display);
+            column.setText(display);
             return;
         }
         String query = activeSearchQuery.trim();
@@ -2566,7 +3389,11 @@ public final class MainActivity extends Activity {
             }
             index = lowerDisplay.indexOf(lowerQuery, Math.max(end, index + 1));
         }
-        readerText.setText(span);
+        column.setText(span);
+    }
+
+    private void setReaderTextWithHighlight(String value, int globalStart) {
+        setColumnTextWithHighlight(readerText, value, globalStart);
     }
 
     private String trimPageDisplayText(String value) {
@@ -2594,14 +3421,18 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private int lazyPageEnd(String text, int start) {
-        if (pageIndex + 1 < pageStarts.size()) {
-            return pageStarts.get(pageIndex + 1);
+    private int lazyPageEndAt(String text, int page) {
+        if (page + 1 < pageStarts.size()) {
+            return pageStarts.get(page + 1);
         }
+        if (page >= pageStarts.size()) {
+            return text.length();
+        }
+        int start = pageStarts.get(page);
         int next = measuredPageBreak(text, start, lazyContentWidth, lazyContentHeight, lazyEstimatedChars);
         next = skipPageBreakWhitespace(text, next);
         if (next > start && next < text.length()) {
-            pageStarts.add(pageIndex + 1, next);
+            pageStarts.add(page + 1, next);
             return next;
         }
         return text.length();
@@ -2688,21 +3519,39 @@ public final class MainActivity extends Activity {
     }
 
     private void applyReaderTextStyle() {
-        if (readerText == null) {
+        applyColumnTextStyle(readerText);
+        applySurfaceTextStyle(pageSurfaceA);
+        applySurfaceTextStyle(pageSurfaceB);
+    }
+
+    private void applySurfaceTextStyle(LinearLayout surface) {
+        if (surface == null) {
             return;
         }
-        readerText.setTextColor(palette.text);
-        readerText.setBackgroundColor(palette.readerBackground);
-        readerText.setTextSize(TypedValue.COMPLEX_UNIT_SP, settings.fontSp);
-        readerText.setLineSpacing(0, settings.lineMultiplier);
-        readerText.setIncludeFontPadding(!settings.pageMode);
-        readerText.setBreakStrategy(Layout.BREAK_STRATEGY_HIGH_QUALITY);
-        readerText.setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE);
+        for (int i = 0; i < surface.getChildCount(); i++) {
+            View child = surface.getChildAt(i);
+            if (child instanceof TextView && child != readerText) {
+                applyColumnTextStyle((TextView) child);
+            }
+        }
+    }
+
+    private void applyColumnTextStyle(TextView column) {
+        if (column == null) {
+            return;
+        }
+        column.setTextColor(palette.text);
+        column.setBackgroundColor(palette.readerBackground);
+        column.setTextSize(TypedValue.COMPLEX_UNIT_SP, settings.fontSp);
+        column.setLineSpacing(0, settings.lineMultiplier);
+        column.setIncludeFontPadding(!settings.pageMode);
+        column.setBreakStrategy(Layout.BREAK_STRATEGY_HIGH_QUALITY);
+        column.setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            readerText.setElegantTextHeight(true);
+            column.setElegantTextHeight(true);
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            readerText.setJustificationMode(Layout.JUSTIFICATION_MODE_INTER_WORD);
+            column.setJustificationMode(Layout.JUSTIFICATION_MODE_INTER_WORD);
         }
     }
 
@@ -2985,7 +3834,7 @@ public final class MainActivity extends Activity {
         dark.setOnClickListener(view -> changeThemeFromDialog("dark", dialog));
         ink.setOnClickListener(view -> changeThemeFromDialog("ink", dialog));
 
-        if (!isEpubBook(currentBook) && !isPdfBook(currentBook) && !isMarkdownBook(currentBook)) {
+        if (!isPdfBook(currentBook)) {
             LinearLayout modeRow = controlRow();
             TextView scroll = pill("滚动", !settings.pageMode);
             TextView page = pill("翻页", settings.pageMode);
@@ -2996,6 +3845,26 @@ public final class MainActivity extends Activity {
             scroll.setOnClickListener(view -> changePageModeFromDialog(false, dialog));
             page.setOnClickListener(view -> changePageModeFromDialog(true, dialog));
         }
+
+        TextView volumeLabel = dialogRow("音量键翻页", "");
+        body.addView(volumeLabel);
+        LinearLayout volumeRow = controlRow();
+        TextView volumeOn = pill("开", settings.volumeTurn);
+        TextView volumeOff = pill("关", !settings.volumeTurn);
+        volumeRow.addView(volumeOn);
+        volumeRow.addView(volumeOff);
+        setMargins(volumeOff, dp(10), 0, 0, 0);
+        body.addView(volumeRow);
+        volumeOn.setOnClickListener(view -> {
+            settings.volumeTurn = true;
+            settings.save(this);
+            dialog.dismiss();
+        });
+        volumeOff.setOnClickListener(view -> {
+            settings.volumeTurn = false;
+            settings.save(this);
+            dialog.dismiss();
+        });
 
         showDialog(dialog);
     }
@@ -3028,16 +3897,17 @@ public final class MainActivity extends Activity {
     }
 
     private void changePageModeFromDialog(boolean pageMode, Dialog dialog) {
-        if (!pageMode && isLargeContent(currentContent)) {
+        boolean txtLike = !isEpubBook(currentBook) && !isMarkdownBook(currentBook) && !isPdfBook(currentBook);
+        if (!pageMode && txtLike && isLargeContent(currentContent)) {
             toast("大文件暂不支持滚动全文模式");
             return;
         }
         settings.pageMode = pageMode;
         settings.save(this);
         dialog.dismiss();
-        if (currentBook != null && currentContent != null) {
+        if (currentBook != null) {
             saveCurrentProgress();
-            showReader(currentBook, currentContent);
+            renderCurrentSurface();
         }
     }
 
@@ -3220,11 +4090,17 @@ public final class MainActivity extends Activity {
         }
         currentBook.lastOpenedAt = System.currentTimeMillis();
         store.saveBooks(books);
+        if (epubWebView != null || markdownWebView != null) {
+            captureWebAnchor();
+        }
     }
 
     private void updateProgressLabel() {
         if (progressView != null) {
             progressView.setText(currentProgressText());
+        }
+        if (readerSeekBar != null && !seekTracking) {
+            readerSeekBar.setProgress(Math.round(clamp(currentScrollProgress()) * 1000));
         }
     }
 
@@ -3234,10 +4110,17 @@ public final class MainActivity extends Activity {
             return (pdfPageIndex + 1) + " / " + count + " · " + Math.round(currentScrollProgress() * 100) + "%";
         }
         if (isMarkdownBook(currentBook)) {
+            if (webPaged && markdownWebView != null) {
+                return (webCurrentPage(markdownWebView) + 1) + " / " + Math.max(1, webPageCount) + " 页 · " + Math.round(currentScrollProgress() * 100) + "%";
+            }
             return Math.round(currentScrollProgress() * 100) + "% · Markdown";
         }
         if (isEpubBook(currentBook) && currentEpubDocument != null) {
-            return (epubChapterIndex + 1) + " / " + Math.max(1, currentEpubDocument.chapters.size()) + " · " + Math.round(currentScrollProgress() * 100) + "%";
+            String chapterPart = (epubChapterIndex + 1) + " / " + Math.max(1, currentEpubDocument.chapters.size()) + " 章";
+            if (webPaged && epubWebView != null) {
+                return chapterPart + " · 本章 " + (webCurrentPage(epubWebView) + 1) + "/" + Math.max(1, webPageCount) + " · " + Math.round(currentScrollProgress() * 100) + "%";
+            }
+            return chapterPart + " · " + Math.round(currentScrollProgress() * 100) + "%";
         }
         if (lazyPagination && settings.pageMode && !pageStarts.isEmpty()) {
             int pageNumber = lazyDisplayPageNumber();
@@ -3295,29 +4178,11 @@ public final class MainActivity extends Activity {
     }
 
     private float epubWebProgress() {
-        if (epubWebView == null) {
-            return 0.0f;
-        }
-        int height = Math.max(1, epubWebView.getHeight());
-        int range = Math.max(1, Math.round(epubWebView.getContentHeight() * epubWebView.getScale()) - height);
-        return clamp(epubWebView.getScrollY() / (float) range);
+        return webContentProgress(epubWebView);
     }
 
     private void restoreEpubWebProgress(float progress, int delayMillis) {
-        if (epubWebView == null) {
-            return;
-        }
-        float safeProgress = clamp(progress);
-        epubWebView.postDelayed(() -> {
-            if (epubWebView == null) {
-                return;
-            }
-            int height = Math.max(1, epubWebView.getHeight());
-            int range = Math.max(0, Math.round(epubWebView.getContentHeight() * epubWebView.getScale()) - height);
-            epubWebView.scrollTo(0, Math.round(safeProgress * range));
-            updateProgressLabel();
-            saveCurrentProgress();
-        }, delayMillis);
+        restoreWebPosition(epubWebView, progress, -1, delayMillis);
     }
 
     private void scrollToProgress(float progress, boolean smooth) {
