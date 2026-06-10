@@ -13,6 +13,9 @@ final class ReaderSettings {
     boolean pageMode = true;
     boolean volumeTurn = true;
     String spread = "auto";
+    String fontFamily = "default";
+    String margin = "standard";
+    boolean indentParagraph = true;
 
     static ReaderSettings load(Context context) {
         SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -25,6 +28,9 @@ final class ReaderSettings {
         settings.pageMode = prefs.getBoolean("pageMode", true);
         settings.volumeTurn = prefs.getBoolean("volumeTurn", true);
         settings.spread = prefs.getString("spread", "auto");
+        settings.fontFamily = prefs.getString("fontFamily", "default");
+        settings.margin = prefs.getString("margin", "standard");
+        settings.indentParagraph = prefs.getBoolean("indentParagraph", true);
         return settings;
     }
 
@@ -39,6 +45,9 @@ final class ReaderSettings {
                 .putBoolean("pageMode", pageMode)
                 .putBoolean("volumeTurn", volumeTurn)
                 .putString("spread", spread)
+                .putString("fontFamily", fontFamily)
+                .putString("margin", margin)
+                .putBoolean("indentParagraph", indentParagraph)
                 .apply();
     }
 }

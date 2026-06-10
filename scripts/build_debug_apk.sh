@@ -40,8 +40,8 @@ awk '
   --custom-package com.nothingreader.app \
   --min-sdk-version 26 \
   --target-sdk-version 35 \
-  --version-code 3 \
-  --version-name 0.3.0 \
+  --version-code 4 \
+  --version-name 0.4.0 \
   "$OUT_DIR/compiled-res.zip"
 
 find "$ROOT_DIR/app/src/main/java" "$OUT_DIR/generated" -name '*.java' | sort > "$OUT_DIR/sources.list"

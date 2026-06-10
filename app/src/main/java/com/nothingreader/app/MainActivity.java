@@ -40,10 +40,15 @@ import android.text.TextWatcher;
 import android.text.TextPaint;
 import android.text.style.BackgroundColorSpan;
 import android.text.style.ForegroundColorSpan;
+import android.text.style.LeadingMarginSpan;
+import android.text.style.UnderlineSpan;
 import android.util.TypedValue;
+import android.view.ActionMode;
 import android.view.DragEvent;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
@@ -53,6 +58,7 @@ import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.view.animation.DecelerateInterpolator;
 import android.view.inputmethod.InputMethodManager;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -813,7 +819,7 @@ public final class MainActivity extends Activity {
         ImageView artwork = new ImageView(this);
         applyBookArtwork(artwork, book);
         artwork.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        artwork.setAlpha("dark".equals(settings.theme) ? 0.72f : 1.0f);
+        artwork.setAlpha(isDarkTheme() ? 0.72f : 1.0f);
         cover.addView(artwork, matchParent());
 
         LinearLayout titlePlate = new LinearLayout(this);
@@ -1368,7 +1374,12 @@ public final class MainActivity extends Activity {
         webSettings.setDefaultTextEncodingName("utf-8");
         webSettings.setBuiltInZoomControls(false);
         webSettings.setDisplayZoomControls(false);
-        epubWebView.setWebViewClient(new WebViewClient());
+        epubWebView.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                return handleEpubLink(request == null ? null : request.getUrl());
+            }
+        });
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             epubWebView.setOnScrollChangeListener((view, scrollX, scrollY, oldScrollX, oldScrollY) -> {
                 updateProgressLabel();
@@ -1484,6 +1495,7 @@ public final class MainActivity extends Activity {
         int hPad = webPagePaddingHorizontalCssPx();
         int vPad = expanded ? 30 : 20;
         int columns = webReaderColumns();
+        String fontFamily = "serif".equals(settings.fontFamily) ? "serif" : "sans-serif";
         StringBuilder css = new StringBuilder();
         css.append("html,body{background:").append(colorCss(palette.readerBackground)).append(";color:").append(colorCss(palette.text)).append(";}");
         if (webPaged) {
@@ -1493,14 +1505,18 @@ public final class MainActivity extends Activity {
                     .append("column-width:calc(").append(100.0f / columns).append("vw - ").append(2 * hPad).append("px);")
                     .append("column-gap:").append(2 * hPad).append("px;")
                     .append("column-fill:auto;")
-                    .append("font-family:sans-serif;font-size:").append(settings.fontSp).append("px;line-height:").append(settings.lineMultiplier).append(";word-break:break-word;}");
+                    .append("font-family:").append(fontFamily).append(";font-size:").append(settings.fontSp).append("px;line-height:").append(settings.lineMultiplier).append(";word-break:break-word;}");
             css.append("img,svg,video{max-width:100%;max-height:calc(100vh - ").append(2 * vPad + 16).append("px);height:auto;display:block;margin:1em auto;}");
         } else {
             css.append("body{margin:0;padding:").append(vPad).append("px ").append(hPad).append("px ").append(vPad + 8).append("px;")
-                    .append("font-family:sans-serif;font-size:").append(settings.fontSp).append("px;line-height:").append(settings.lineMultiplier).append(";word-break:break-word;}");
+                    .append("font-family:").append(fontFamily).append(";font-size:").append(settings.fontSp).append("px;line-height:").append(settings.lineMultiplier).append(";word-break:break-word;}");
             css.append("img,svg,video{max-width:100%;height:auto;display:block;margin:1.1em auto;}");
         }
-        css.append("p{margin:0 0 1.05em 0;text-align:justify;}h1,h2,h3,h4,h5,h6{line-height:1.25;margin:1.2em 0 .65em;font-weight:700;}h1{font-size:1.55em;}h2{font-size:1.35em;}h3{font-size:1.18em;}h4,h5,h6{font-size:1.08em;}");
+        css.append("p{margin:0 0 1.05em 0;text-align:justify;");
+        if (!markdown && settings.indentParagraph) {
+            css.append("text-indent:2em;");
+        }
+        css.append("}h1,h2,h3,h4,h5,h6{line-height:1.25;margin:1.2em 0 .65em;font-weight:700;}h1{font-size:1.55em;}h2{font-size:1.35em;}h3{font-size:1.18em;}h4,h5,h6{font-size:1.08em;}");
         css.append("figure{margin:1.1em 0;text-align:center;}figcaption{font-size:.82em;color:").append(colorCss(palette.muted)).append(";}");
         css.append("blockquote{border-left:3px solid ").append(colorCss(palette.accent)).append(";margin:1em 0;padding:.2em 0 .2em 1em;color:").append(colorCss(palette.muted)).append(";}");
         css.append("ul,ol{padding-left:1.4em;}li{margin:.35em 0;}");
@@ -1518,10 +1534,19 @@ public final class MainActivity extends Activity {
     }
 
     private int webPagePaddingHorizontalCssPx() {
+        int base;
+        int step;
         if (webPaged && webReaderColumns() >= 2) {
-            return 34;
+            base = 34;
+            step = 10;
+        } else if (isExpandedLayout()) {
+            base = 72;
+            step = 22;
+        } else {
+            base = 22;
+            step = 8;
         }
-        return isExpandedLayout() ? 72 : 22;
+        return Math.max(10, base + marginLevel() * step);
     }
 
     private int webReaderColumns() {
@@ -1660,6 +1685,143 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private boolean handleEpubLink(Uri uri) {
+        if (uri == null || currentEpubDocument == null || epubWebView == null) {
+            return true;
+        }
+        String scheme = nonEmpty(uri.getScheme(), "").toLowerCase(Locale.US);
+        if ("http".equals(scheme) || "https".equals(scheme)) {
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW, uri));
+            } catch (Exception exception) {
+                toast("无法打开外部链接");
+            }
+            return true;
+        }
+        if (!"file".equals(scheme)) {
+            return true;
+        }
+        String path = uri.getPath() == null ? "" : uri.getPath();
+        String fragment = uri.getFragment();
+        String currentPath = "";
+        try {
+            currentPath = new File(currentEpubDocument.rootDir,
+                    currentEpubDocument.chapters.get(Math.max(0, Math.min(epubChapterIndex, currentEpubDocument.chapters.size() - 1))).path)
+                    .getCanonicalPath();
+        } catch (Exception ignored) {
+        }
+        String targetPath = path;
+        try {
+            targetPath = new File(path).getCanonicalPath();
+        } catch (Exception ignored) {
+        }
+        if (path.isEmpty() || targetPath.equals(currentPath)) {
+            if (fragment != null && !fragment.trim().isEmpty()) {
+                showEpubFootnotePopup(fragment.trim());
+            }
+            return true;
+        }
+        for (int i = 0; i < currentEpubDocument.chapters.size(); i++) {
+            try {
+                String chapterPath = new File(currentEpubDocument.rootDir, currentEpubDocument.chapters.get(i).path).getCanonicalPath();
+                if (chapterPath.equals(targetPath)) {
+                    epubPendingChapterProgress = 0.0f;
+                    final String pendingFragment = fragment;
+                    loadEpubChapter(i);
+                    if (pendingFragment != null && !pendingFragment.trim().isEmpty()) {
+                        handler.postDelayed(() -> scrollWebToElementId(epubWebView, pendingFragment.trim()), 460);
+                    }
+                    return true;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return true;
+    }
+
+    private void showEpubFootnotePopup(String fragment) {
+        if (epubWebView == null) {
+            return;
+        }
+        String escaped = fragment.replace("\\", "\\\\").replace("'", "\\'");
+        String js = "(function(){var el=document.getElementById('" + escaped + "');"
+                + "if(!el){var named=document.getElementsByName('" + escaped + "');if(named&&named.length>0){el=named[0];}}"
+                + "if(!el)return '';"
+                + "var t=(el.innerText||el.textContent||'').trim();"
+                + "if(t.length<4&&el.parentElement){t=(el.parentElement.innerText||'').trim();}"
+                + "if(t.length<4&&el.closest){var holder=el.closest('li,aside,p,div');if(holder){t=(holder.innerText||'').trim();}}"
+                + "return t.slice(0,600);})()";
+        epubWebView.evaluateJavascript(js, value -> {
+            String note = decodeJsString(value);
+            if (note == null || note.trim().isEmpty()) {
+                scrollWebToElementId(epubWebView, fragment);
+                return;
+            }
+            Dialog dialog = baseDialog("注释");
+            LinearLayout body = dialogBody(dialog);
+            TextView content = dialogRow(note.trim(), "");
+            content.setClickable(false);
+            body.addView(content);
+            TextView jump = pill("跳转到注释位置", true);
+            jump.setGravity(Gravity.CENTER);
+            jump.setMinHeight(dp(38));
+            jump.setOnClickListener(view -> {
+                dialog.dismiss();
+                scrollWebToElementId(epubWebView, fragment);
+            });
+            body.addView(jump, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            setMargins(jump, 0, dp(12), 0, 0);
+            showDialog(dialog);
+        });
+    }
+
+    private static String decodeJsString(String value) {
+        if (value == null || "null".equals(value)) {
+            return null;
+        }
+        try {
+            Object parsed = new org.json.JSONTokener(value).nextValue();
+            if (parsed instanceof String) {
+                return (String) parsed;
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private void scrollWebToElementId(WebView webView, String elementId) {
+        if (webView == null || elementId == null || elementId.trim().isEmpty()) {
+            return;
+        }
+        String escaped = elementId.trim().replace("\\", "\\\\").replace("'", "\\'");
+        if (webPaged) {
+            String js = "(function(){var el=document.getElementById('" + escaped + "');"
+                    + "if(!el){var named=document.getElementsByName('" + escaped + "');if(named&&named.length>0){el=named[0];}}"
+                    + "if(!el)return -1;var r=el.getBoundingClientRect();"
+                    + "return Math.max(0,Math.floor((r.left+(window.scrollX||0)+2)/Math.max(1,window.innerWidth)));})()";
+            webView.evaluateJavascript(js, value -> {
+                try {
+                    int page = Math.round(Float.parseFloat(value.trim()));
+                    if (page >= 0) {
+                        webView.scrollTo(Math.min(Math.max(0, webPageCount - 1), page) * Math.max(1, webView.getWidth()), 0);
+                        updateProgressLabel();
+                        saveCurrentProgress();
+                    }
+                } catch (Exception ignored) {
+                }
+            });
+            return;
+        }
+        String js = "(function(){var el=document.getElementById('" + escaped + "');"
+                + "if(!el){var named=document.getElementsByName('" + escaped + "');if(named&&named.length>0){el=named[0];}}"
+                + "if(el){el.scrollIntoView({block:'start'});return true;}return false;})()";
+        webView.evaluateJavascript(js, null);
+        webView.postDelayed(() -> {
+            updateProgressLabel();
+            saveCurrentProgress();
+        }, 260);
+    }
+
     private void showEpubTocDialog() {
         if (currentEpubDocument == null) {
             return;
@@ -1788,7 +1950,29 @@ public final class MainActivity extends Activity {
         webSettings.setDefaultTextEncodingName("utf-8");
         webSettings.setBuiltInZoomControls(false);
         webSettings.setDisplayZoomControls(false);
-        markdownWebView.setWebViewClient(new WebViewClient());
+        markdownWebView.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                Uri uri = request == null ? null : request.getUrl();
+                if (uri == null) {
+                    return true;
+                }
+                String scheme = nonEmpty(uri.getScheme(), "").toLowerCase(Locale.US);
+                if ("http".equals(scheme) || "https".equals(scheme)) {
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                    } catch (Exception exception) {
+                        toast("无法打开外部链接");
+                    }
+                    return true;
+                }
+                String fragment = uri.getFragment();
+                if (fragment != null && !fragment.trim().isEmpty()) {
+                    scrollWebToElementId(markdownWebView, fragment.trim());
+                }
+                return true;
+            }
+        });
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             markdownWebView.setOnScrollChangeListener((view, scrollX, scrollY, oldScrollX, oldScrollY) -> {
                 updateProgressLabel();
@@ -1870,7 +2054,7 @@ public final class MainActivity extends Activity {
     }
 
     private int markdownCodeBackground() {
-        if ("dark".equals(settings.theme)) {
+        if (isDarkTheme()) {
             return Color.rgb(35, 35, 34);
         }
         if ("ink".equals(settings.theme)) {
@@ -2034,12 +2218,7 @@ public final class MainActivity extends Activity {
     }
 
     private void scrollMarkdownToAnchor(String anchor) {
-        if (markdownWebView == null || anchor == null || anchor.trim().isEmpty()) {
-            return;
-        }
-        String escaped = anchor.replace("\\", "\\\\").replace("'", "\\'");
-        markdownWebView.evaluateJavascript("(function(){var el=document.getElementById('" + escaped + "'); if(el){el.scrollIntoView({block:'start'}); return true;} return false;})()", null);
-        markdownWebView.postDelayed(this::saveCurrentProgress, 260);
+        scrollWebToElementId(markdownWebView, anchor);
     }
 
     private float markdownWebProgress() {
@@ -2648,6 +2827,8 @@ public final class MainActivity extends Activity {
             readerText = text(content.fullText, settings.fontSp, palette.text, Typeface.NORMAL);
             readerText.setPadding(expanded ? dp(30) : dp(24), expanded ? dp(26) : dp(20), expanded ? dp(30) : dp(24), expanded ? dp(56) : dp(44));
             readerText.setTextIsSelectable(true);
+            readerText.setTag(0);
+            attachSelectionAffordances(readerText);
             applyReaderTextStyle();
 
             FrameLayout textFrame = new FrameLayout(this);
@@ -2839,22 +3020,11 @@ public final class MainActivity extends Activity {
     }
 
     private void addPageTurnZones(FrameLayout readingFrame) {
-        View previous = new View(this);
-        previous.setBackgroundColor(Color.TRANSPARENT);
-        previous.setClickable(true);
-        attachPageGesture(previous, -1);
-        FrameLayout.LayoutParams previousParams = new FrameLayout.LayoutParams(dp(isExpandedLayout() ? 220 : 148), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.LEFT);
-        readingFrame.addView(previous, previousParams);
-
-        View next = new View(this);
-        next.setBackgroundColor(Color.TRANSPARENT);
-        next.setClickable(true);
-        attachPageGesture(next, 1);
-        FrameLayout.LayoutParams nextParams = new FrameLayout.LayoutParams(dp(isExpandedLayout() ? 260 : 172), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.RIGHT);
-        readingFrame.addView(next, nextParams);
+        // 翻页点按分区由可选择的文本列自行处理（左 34% / 中部呼出工具栏 / 右 34%），
+        // 不再叠加透明热区 View，避免挡住长按选词。
         if (readerPagesFrame != null) {
             attachPageGesture(readerPagesFrame, 0);
-        } else {
+        } else if (readerText != null) {
             attachPageGesture(readerText, 0);
         }
     }
@@ -2874,7 +3044,8 @@ public final class MainActivity extends Activity {
         LinearLayout surface = new LinearLayout(this);
         surface.setOrientation(LinearLayout.HORIZONTAL);
         surface.setBackgroundColor(palette.readerBackground);
-        int outer = columns >= 2 ? dp(44) : (expanded ? dp(76) : dp(24));
+        int marginAdjust = marginLevel() * (columns >= 2 ? dp(12) : (expanded ? dp(20) : dp(8)));
+        int outer = Math.max(dp(10), (columns >= 2 ? dp(44) : (expanded ? dp(76) : dp(24))) + marginAdjust);
         surface.setPadding(outer, 0, outer, 0);
         int vTop = expanded ? dp(32) : dp(20);
         int vBottom = expanded ? dp(28) : dp(22);
@@ -2886,10 +3057,155 @@ public final class MainActivity extends Activity {
             TextView column = text("", settings.fontSp, palette.text, Typeface.NORMAL);
             column.setPadding(0, vTop, 0, vBottom);
             column.setGravity(Gravity.TOP);
-            column.setTextIsSelectable(false);
+            column.setTextIsSelectable(true);
+            column.setLongClickable(true);
+            attachSelectionAffordances(column);
+            attachPageGesture(column, 0);
             surface.addView(column, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1));
         }
         return surface;
+    }
+
+    private static final int MENU_HIGHLIGHT = 9101;
+    private static final int MENU_NOTE = 9102;
+    private static final int MENU_SEARCH_SELECTION = 9103;
+    private static final int MENU_DICTIONARY = 9104;
+
+    private void attachSelectionAffordances(TextView column) {
+        column.setCustomSelectionActionModeCallback(new ActionMode.Callback() {
+            @Override
+            public boolean onCreateActionMode(ActionMode mode, Menu menu) {
+                boolean canAnnotate = !isEpubBook(currentBook) && !isMarkdownBook(currentBook) && !isPdfBook(currentBook);
+                if (canAnnotate) {
+                    menu.add(Menu.NONE, MENU_HIGHLIGHT, 100, "划线");
+                    menu.add(Menu.NONE, MENU_NOTE, 101, "笔记");
+                }
+                menu.add(Menu.NONE, MENU_SEARCH_SELECTION, 102, "搜索");
+                menu.add(Menu.NONE, MENU_DICTIONARY, 103, "词典");
+                return true;
+            }
+
+            @Override
+            public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
+                return false;
+            }
+
+            @Override
+            public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
+                int start = column.getSelectionStart();
+                int end = column.getSelectionEnd();
+                if (start < 0 || end <= start) {
+                    return false;
+                }
+                String selected = column.getText().toString().substring(start, Math.min(end, column.getText().length()));
+                int base = column.getTag() instanceof Integer ? (Integer) column.getTag() : -1;
+                int id = item.getItemId();
+                if (id == MENU_HIGHLIGHT && base >= 0) {
+                    addAnnotation(base + start, base + end, selected, null);
+                    mode.finish();
+                    return true;
+                }
+                if (id == MENU_NOTE && base >= 0) {
+                    mode.finish();
+                    showAddNoteDialog(base + start, base + end, selected);
+                    return true;
+                }
+                if (id == MENU_SEARCH_SELECTION) {
+                    mode.finish();
+                    showSearchDialogWithQuery(selected);
+                    return true;
+                }
+                if (id == MENU_DICTIONARY) {
+                    mode.finish();
+                    openDictionary(selected);
+                    return true;
+                }
+                return false;
+            }
+
+            @Override
+            public void onDestroyActionMode(ActionMode mode) {
+            }
+        });
+    }
+
+    private void addAnnotation(int start, int end, String selected, String note) {
+        if (currentBook == null || end <= start) {
+            return;
+        }
+        String snippet = selected == null ? "" : selected.replaceAll("\\s+", " ").trim();
+        if (snippet.length() > 120) {
+            snippet = snippet.substring(0, 120);
+        }
+        Annotation annotation = new Annotation(
+                UUID.randomUUID().toString(),
+                start,
+                end,
+                snippet,
+                note,
+                chapterForOffset(start),
+                System.currentTimeMillis());
+        currentBook.annotations.add(annotation);
+        store.saveBooks(books);
+        toast(annotation.hasNote() ? "已保存笔记" : "已划线");
+        if (settings.pageMode) {
+            renderCurrentPage();
+        }
+    }
+
+    private void showAddNoteDialog(int start, int end, String selected) {
+        Dialog dialog = baseDialog("写笔记");
+        LinearLayout body = dialogBody(dialog);
+
+        String snippet = selected == null ? "" : selected.replaceAll("\\s+", " ").trim();
+        TextView quote = dialogRow(snippet.length() > 90 ? snippet.substring(0, 90) + "…" : snippet, "");
+        quote.setClickable(false);
+        body.addView(quote);
+
+        EditText input = new EditText(this);
+        input.setHint("写下你的想法…");
+        input.setTextColor(palette.text);
+        input.setHintTextColor(palette.muted);
+        input.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        input.setMinLines(3);
+        input.setMaxLines(8);
+        input.setGravity(Gravity.TOP);
+        input.setPadding(dp(12), dp(10), dp(12), dp(10));
+        input.setBackground(border(palette.readerBackground, palette.hairline, 4, 1));
+        body.addView(input, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        setMargins(input, 0, dp(10), 0, 0);
+
+        TextView save = pill("保存", true);
+        save.setGravity(Gravity.CENTER);
+        save.setMinHeight(dp(40));
+        save.setOnClickListener(view -> {
+            addAnnotation(start, end, selected, input.getText().toString());
+            dialog.dismiss();
+        });
+        body.addView(save, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        setMargins(save, 0, dp(12), 0, 0);
+
+        showDialog(dialog);
+        input.requestFocus();
+    }
+
+    private void openDictionary(String selected) {
+        String query = selected == null ? "" : selected.trim();
+        if (query.isEmpty()) {
+            return;
+        }
+        if (query.length() > 80) {
+            query = query.substring(0, 80);
+        }
+        try {
+            Intent intent = new Intent(Intent.ACTION_PROCESS_TEXT);
+            intent.setType("text/plain");
+            intent.putExtra(Intent.EXTRA_PROCESS_TEXT, query);
+            intent.putExtra(Intent.EXTRA_PROCESS_TEXT_READONLY, true);
+            startActivity(Intent.createChooser(intent, "查词"));
+        } catch (Exception exception) {
+            toast("未找到可用的词典应用");
+        }
     }
 
     private TextView surfaceColumn(LinearLayout surface, int index) {
@@ -3049,13 +3365,18 @@ public final class MainActivity extends Activity {
             if (!settings.pageMode) {
                 return false;
             }
+            boolean selecting = target instanceof TextView && ((TextView) target).hasSelection();
             switch (event.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN: {
                     touchDownX = event.getX();
                     touchDownY = event.getY();
-                    return true;
+                    // 返回 false 让 TextView 接收事件，以支持长按选词。
+                    return false;
                 }
                 case MotionEvent.ACTION_MOVE: {
+                    if (selecting && !pageDragging) {
+                        return false;
+                    }
                     if (pageAnimating) {
                         return true;
                     }
@@ -3066,8 +3387,9 @@ public final class MainActivity extends Activity {
                     }
                     if (pageDragging) {
                         updatePageDrag(dx);
+                        return true;
                     }
-                    return true;
+                    return false;
                 }
                 case MotionEvent.ACTION_UP: {
                     float dx = event.getX() - touchDownX;
@@ -3075,6 +3397,9 @@ public final class MainActivity extends Activity {
                     if (pageDragging) {
                         finishPageDrag(dx);
                         return true;
+                    }
+                    if (selecting) {
+                        return false;
                     }
                     if (pageAnimating) {
                         return true;
@@ -3322,10 +3647,11 @@ public final class MainActivity extends Activity {
             return text.length();
         }
         int windowEnd = Math.min(text.length(), start + Math.max(estimatedChars * 2, estimatedChars + 320));
+        boolean headParagraph = start == 0 || Character.isWhitespace(text.charAt(start - 1));
         StaticLayout layout = null;
         for (int attempt = 0; attempt < 4; attempt++) {
             CharSequence window = text.subSequence(start, windowEnd);
-            layout = pageLayout(window, contentWidth);
+            layout = pageLayout(window, contentWidth, headParagraph);
             int lineCount = layout.getLineCount();
             if (lineCount == 0) {
                 return Math.min(text.length(), start + Math.max(1, estimatedChars));
@@ -3354,9 +3680,10 @@ public final class MainActivity extends Activity {
         return Math.min(text.length(), start + Math.max(1, estimatedChars));
     }
 
-    private StaticLayout pageLayout(CharSequence text, int width) {
+    private StaticLayout pageLayout(CharSequence text, int width, boolean headParagraph) {
         TextPaint paint = new TextPaint(readerText.getPaint());
-        StaticLayout.Builder builder = StaticLayout.Builder.obtain(text, 0, text.length(), paint, width)
+        CharSequence measured = withIndentSpans(text, paint, headParagraph);
+        StaticLayout.Builder builder = StaticLayout.Builder.obtain(measured, 0, measured.length(), paint, width)
                 .setAlignment(Layout.Alignment.ALIGN_NORMAL)
                 .setLineSpacing(0, settings.lineMultiplier)
                 .setIncludePad(false)
@@ -3453,31 +3780,103 @@ public final class MainActivity extends Activity {
     }
 
     private void setColumnTextWithHighlight(TextView column, String value, int globalStart) {
-        String display = trimPageDisplayText(value);
         if (column == null) {
             return;
         }
-        if (activeSearchQuery == null || activeSearchQuery.trim().isEmpty()) {
-            column.setText(display);
+        String display = trimPageDisplayText(value);
+        int trimmedLead = 0;
+        while (trimmedLead < value.length()
+                && (value.charAt(trimmedLead) == '\n' || value.charAt(trimmedLead) == '\r')) {
+            trimmedLead++;
+        }
+        int displayBase = globalStart + trimmedLead;
+        column.setTag(displayBase);
+
+        boolean pageSized = settings.pageMode && display.length() <= 40000;
+        SpannableString span = new SpannableString(display);
+
+        if (pageSized && settings.indentParagraph) {
+            boolean headParagraph = trimmedLead > 0 || displayBase == 0 || isParagraphHead(displayBase);
+            applyIndentSpansTo(span, column.getPaint(), headParagraph);
+        }
+
+        if (pageSized && currentBook != null && !currentBook.annotations.isEmpty()) {
+            int annotationColor = Color.argb(isDarkTheme() ? 64 : 48, 205, 47, 47);
+            for (Annotation annotation : currentBook.annotations) {
+                int from = annotation.startOffset - displayBase;
+                int to = annotation.endOffset - displayBase;
+                if (to <= 0 || from >= display.length()) {
+                    continue;
+                }
+                from = Math.max(0, from);
+                to = Math.min(display.length(), to);
+                if (to <= from) {
+                    continue;
+                }
+                span.setSpan(new BackgroundColorSpan(annotationColor), from, to, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                span.setSpan(new UnderlineSpan(), from, to, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+        }
+
+        if (activeSearchQuery != null && !activeSearchQuery.trim().isEmpty()) {
+            String query = activeSearchQuery.trim();
+            String lowerDisplay = display.toLowerCase(Locale.ROOT);
+            String lowerQuery = query.toLowerCase(Locale.ROOT);
+            int index = lowerDisplay.indexOf(lowerQuery);
+            int highlightColor = Color.argb(isDarkTheme() ? 120 : 92, 205, 47, 47);
+            int activeColor = Color.argb(isDarkTheme() ? 190 : 145, 205, 47, 47);
+            while (index >= 0) {
+                int end = Math.min(display.length(), index + query.length());
+                boolean active = activeSearchOffset >= 0 && activeSearchOffset >= displayBase + index && activeSearchOffset < displayBase + end;
+                span.setSpan(new BackgroundColorSpan(active ? activeColor : highlightColor), index, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                if (active) {
+                    span.setSpan(new ForegroundColorSpan(palette.text), index, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                }
+                index = lowerDisplay.indexOf(lowerQuery, Math.max(end, index + 1));
+            }
+        }
+
+        column.setText(span);
+    }
+
+    private boolean isParagraphHead(int globalOffset) {
+        if (currentContent == null || currentContent.fullText == null) {
+            return false;
+        }
+        String text = currentContent.fullText;
+        if (globalOffset <= 0 || globalOffset > text.length()) {
+            return globalOffset <= 0;
+        }
+        return Character.isWhitespace(text.charAt(globalOffset - 1));
+    }
+
+    private void applyIndentSpansTo(SpannableString span, TextPaint paint, boolean headParagraph) {
+        int indentPx = Math.round(paint.measureText("汉汉"));
+        if (indentPx <= 0) {
             return;
         }
-        String query = activeSearchQuery.trim();
-        String lowerDisplay = display.toLowerCase(Locale.ROOT);
-        String lowerQuery = query.toLowerCase(Locale.ROOT);
-        SpannableString span = new SpannableString(display);
-        int index = lowerDisplay.indexOf(lowerQuery);
-        int highlightColor = Color.argb("dark".equals(settings.theme) ? 120 : 92, 205, 47, 47);
-        int activeColor = Color.argb("dark".equals(settings.theme) ? 190 : 145, 205, 47, 47);
-        while (index >= 0) {
-            int end = Math.min(display.length(), index + query.length());
-            boolean active = activeSearchOffset >= 0 && activeSearchOffset >= globalStart + index && activeSearchOffset < globalStart + end;
-            span.setSpan(new BackgroundColorSpan(active ? activeColor : highlightColor), index, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-            if (active) {
-                span.setSpan(new ForegroundColorSpan(palette.text), index, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        String value = span.toString();
+        int length = value.length();
+        int paragraphStart = 0;
+        boolean indentThis = headParagraph;
+        while (paragraphStart < length) {
+            int newline = value.indexOf('\n', paragraphStart);
+            int paragraphEnd = newline < 0 ? length : newline + 1;
+            if (indentThis && paragraphEnd > paragraphStart) {
+                span.setSpan(new LeadingMarginSpan.Standard(indentPx, 0), paragraphStart, paragraphEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             }
-            index = lowerDisplay.indexOf(lowerQuery, Math.max(end, index + 1));
+            indentThis = true;
+            paragraphStart = paragraphEnd;
         }
-        column.setText(span);
+    }
+
+    private CharSequence withIndentSpans(CharSequence value, TextPaint paint, boolean headParagraph) {
+        if (!settings.indentParagraph) {
+            return value;
+        }
+        SpannableString span = new SpannableString(value);
+        applyIndentSpansTo(span, paint, headParagraph);
+        return span;
     }
 
     private void setReaderTextWithHighlight(String value, int globalStart) {
@@ -3630,6 +4029,7 @@ public final class MainActivity extends Activity {
         }
         column.setTextColor(palette.text);
         column.setBackgroundColor(palette.readerBackground);
+        column.setTypeface(readerTypeface(Typeface.NORMAL));
         column.setTextSize(TypedValue.COMPLEX_UNIT_SP, settings.fontSp);
         column.setLineSpacing(0, settings.lineMultiplier);
         column.setIncludeFontPadding(!settings.pageMode);
@@ -3672,6 +4072,10 @@ public final class MainActivity extends Activity {
     }
 
     private void showSearchDialog() {
+        showSearchDialogWithQuery("");
+    }
+
+    private void showSearchDialogWithQuery(String initialQuery) {
         if (currentContent == null) {
             return;
         }
@@ -3709,6 +4113,15 @@ public final class MainActivity extends Activity {
         });
 
         showDialog(dialog);
+        if (initialQuery != null && !initialQuery.trim().isEmpty()) {
+            String prefill = initialQuery.trim();
+            if (prefill.length() > 40) {
+                prefill = prefill.substring(0, 40);
+            }
+            input.setText(prefill);
+            input.setSelection(prefill.length());
+            renderSearchResults(prefill, results, dialog);
+        }
         input.requestFocus();
         input.postDelayed(() -> {
             InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
@@ -3818,6 +4231,49 @@ public final class MainActivity extends Activity {
             });
             body.addView(row);
         }
+
+        boolean annotatable = !isEpubBook(currentBook) && !isMarkdownBook(currentBook) && !isPdfBook(currentBook);
+        if (annotatable) {
+            TextView annotationTitle = text("划线与笔记", 14, palette.muted, Typeface.BOLD);
+            annotationTitle.setIncludeFontPadding(false);
+            body.addView(annotationTitle);
+            setMargins(annotationTitle, 0, dp(16), 0, 0);
+
+            ArrayList<Annotation> sortedAnnotations = new ArrayList<>(currentBook.annotations);
+            Collections.sort(sortedAnnotations, (left, right) -> Integer.compare(left.startOffset, right.startOffset));
+            if (sortedAnnotations.isEmpty()) {
+                TextView empty = dialogRow("暂无划线", "长按选中正文即可划线或写笔记");
+                empty.setClickable(false);
+                body.addView(empty);
+            }
+            for (Annotation annotation : sortedAnnotations) {
+                String title = nonEmpty(annotation.snippet, "划线");
+                StringBuilder subtitle = new StringBuilder();
+                if (annotation.hasNote()) {
+                    subtitle.append("笔记：").append(annotation.note.trim()).append("\n");
+                }
+                if (annotation.chapterTitle != null && !annotation.chapterTitle.trim().isEmpty()) {
+                    subtitle.append(annotation.chapterTitle.trim()).append(" · ");
+                }
+                subtitle.append(formatTime(annotation.createdAt)).append("\n点按跳转，长按删除");
+                TextView row = dialogRow((annotation.hasNote() ? "✎ " : "— ") + title, subtitle.toString());
+                row.setOnClickListener(view -> {
+                    dialog.dismiss();
+                    scrollToOffset(annotation.startOffset, true);
+                });
+                row.setOnLongClickListener(view -> {
+                    currentBook.annotations.remove(annotation);
+                    store.saveBooks(books);
+                    if (settings.pageMode) {
+                        renderCurrentPage();
+                    }
+                    dialog.dismiss();
+                    showBookmarksDialog();
+                    return true;
+                });
+                body.addView(row);
+            }
+        }
         showDialog(dialog);
     }
 
@@ -3912,15 +4368,59 @@ public final class MainActivity extends Activity {
         TextView paper = pill("浅", "paper".equals(settings.theme));
         TextView dark = pill("深", "dark".equals(settings.theme));
         TextView ink = pill("墨", "ink".equals(settings.theme));
+        TextView system = pill("随系统", "system".equals(settings.theme));
         themeRow.addView(paper);
         themeRow.addView(dark);
         themeRow.addView(ink);
+        themeRow.addView(system);
         setMargins(dark, dp(10), 0, 0, 0);
         setMargins(ink, dp(10), 0, 0, 0);
+        setMargins(system, dp(10), 0, 0, 0);
         body.addView(themeRow);
         paper.setOnClickListener(view -> changeThemeFromDialog("paper", dialog));
         dark.setOnClickListener(view -> changeThemeFromDialog("dark", dialog));
         ink.setOnClickListener(view -> changeThemeFromDialog("ink", dialog));
+        system.setOnClickListener(view -> changeThemeFromDialog("system", dialog));
+
+        TextView fontLabel = dialogRow("字体", "衬线依赖系统字库，缺字时自动回退");
+        body.addView(fontLabel);
+        LinearLayout fontFamilyRow = controlRow();
+        TextView fontDefault = pill("默认", "default".equals(settings.fontFamily));
+        TextView fontSerif = pill("衬线", "serif".equals(settings.fontFamily));
+        fontFamilyRow.addView(fontDefault);
+        fontFamilyRow.addView(fontSerif);
+        setMargins(fontSerif, dp(10), 0, 0, 0);
+        body.addView(fontFamilyRow);
+        fontDefault.setOnClickListener(view -> changeFontFamilyFromDialog("default", dialog));
+        fontSerif.setOnClickListener(view -> changeFontFamilyFromDialog("serif", dialog));
+
+        TextView marginLabel = dialogRow("页边距", "");
+        body.addView(marginLabel);
+        LinearLayout marginRow = controlRow();
+        TextView marginNarrow = pill("窄", "narrow".equals(settings.margin));
+        TextView marginStandard = pill("标准", "standard".equals(settings.margin));
+        TextView marginWide = pill("宽", "wide".equals(settings.margin));
+        marginRow.addView(marginNarrow);
+        marginRow.addView(marginStandard);
+        marginRow.addView(marginWide);
+        setMargins(marginStandard, dp(10), 0, 0, 0);
+        setMargins(marginWide, dp(10), 0, 0, 0);
+        body.addView(marginRow);
+        marginNarrow.setOnClickListener(view -> changeMarginFromDialog("narrow", dialog));
+        marginStandard.setOnClickListener(view -> changeMarginFromDialog("standard", dialog));
+        marginWide.setOnClickListener(view -> changeMarginFromDialog("wide", dialog));
+
+        TextView indentLabel = dialogRow("段落首行缩进", "");
+        body.addView(indentLabel);
+        LinearLayout indentRow = controlRow();
+        TextView indentOn = pill("开", settings.indentParagraph);
+        TextView indentOff = pill("关", !settings.indentParagraph);
+        indentRow.addView(indentOn);
+        indentRow.addView(indentOff);
+        setMargins(indentOff, dp(10), 0, 0, 0);
+        body.addView(indentRow);
+        indentOn.setOnClickListener(view -> changeIndentFromDialog(true, dialog));
+        indentOff.setOnClickListener(view -> changeIndentFromDialog(false, dialog));
 
         if (!isPdfBook(currentBook)) {
             LinearLayout modeRow = controlRow();
@@ -3998,6 +4498,36 @@ public final class MainActivity extends Activity {
             return;
         }
         applyReaderTextChange(restoreOffset);
+    }
+
+    private void changeFontFamilyFromDialog(String fontFamily, Dialog dialog) {
+        settings.fontFamily = fontFamily;
+        settings.save(this);
+        dialog.dismiss();
+        if (currentBook != null) {
+            saveCurrentProgress();
+            renderCurrentSurface();
+        }
+    }
+
+    private void changeMarginFromDialog(String margin, Dialog dialog) {
+        settings.margin = margin;
+        settings.save(this);
+        dialog.dismiss();
+        if (currentBook != null) {
+            saveCurrentProgress();
+            renderCurrentSurface();
+        }
+    }
+
+    private void changeIndentFromDialog(boolean indent, Dialog dialog) {
+        settings.indentParagraph = indent;
+        settings.save(this);
+        dialog.dismiss();
+        if (currentBook != null) {
+            saveCurrentProgress();
+            renderCurrentSurface();
+        }
     }
 
     private void changeSpreadFromDialog(String spread, Dialog dialog) {
@@ -4154,7 +4684,7 @@ public final class MainActivity extends Activity {
         ImageView background = new ImageView(this);
         background.setImageResource(R.drawable.loading_background);
         background.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        background.setAlpha("dark".equals(settings.theme) ? 0.42f : 1.0f);
+        background.setAlpha(isDarkTheme() ? 0.42f : 1.0f);
         page.addView(background, matchParent());
 
         LinearLayout copy = new LinearLayout(this);
@@ -4485,6 +5015,8 @@ public final class MainActivity extends Activity {
             settings.theme = "dark";
         } else if ("dark".equals(settings.theme)) {
             settings.theme = "ink";
+        } else if ("ink".equals(settings.theme)) {
+            settings.theme = "system";
         } else {
             settings.theme = "paper";
         }
@@ -4492,6 +5024,9 @@ public final class MainActivity extends Activity {
     }
 
     private String themeGlyph() {
+        if ("system".equals(settings.theme)) {
+            return "◑";
+        }
         if ("dark".equals(settings.theme)) {
             return "●";
         }
@@ -4548,8 +5083,35 @@ public final class MainActivity extends Activity {
         return dp(railDp);
     }
 
+    private String resolvedTheme() {
+        if ("system".equals(settings.theme)) {
+            int nightMask = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+            return nightMask == Configuration.UI_MODE_NIGHT_YES ? "dark" : "paper";
+        }
+        return settings.theme;
+    }
+
+    private boolean isDarkTheme() {
+        return "dark".equals(resolvedTheme());
+    }
+
+    private Typeface readerTypeface(int style) {
+        Typeface base = "serif".equals(settings.fontFamily) ? Typeface.SERIF : Typeface.DEFAULT;
+        return Typeface.create(base, style);
+    }
+
+    private int marginLevel() {
+        if ("narrow".equals(settings.margin)) {
+            return -1;
+        }
+        if ("wide".equals(settings.margin)) {
+            return 1;
+        }
+        return 0;
+    }
+
     private void refreshPalette() {
-        palette = Palette.from(settings.theme);
+        palette = Palette.from(resolvedTheme());
         applySystemChrome(palette.background);
     }
 
@@ -4563,7 +5125,7 @@ public final class MainActivity extends Activity {
             int flags = edgeToEdgeFlags();
             getWindow().getDecorView().setSystemUiVisibility(flags);
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !"dark".equals(settings.theme)) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !isDarkTheme()) {
             WindowInsetsController controller = getWindow().getInsetsController();
             if (controller != null) {
                 int appearance = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
@@ -4590,10 +5152,10 @@ public final class MainActivity extends Activity {
         int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                 | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
-        if (!"dark".equals(settings.theme) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        if (!isDarkTheme() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
         }
-        if (!"dark".equals(settings.theme) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (!isDarkTheme() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
         }
         return flags;

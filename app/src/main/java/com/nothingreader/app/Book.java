@@ -20,6 +20,7 @@ final class Book {
     long lastOpenedAt;
     float progress;
     final List<Bookmark> bookmarks = new ArrayList<>();
+    final List<Annotation> annotations = new ArrayList<>();
 
     JSONObject toJson() throws JSONException {
         JSONObject json = new JSONObject();
@@ -39,6 +40,11 @@ final class Book {
             bookmarkArray.put(bookmark.toJson());
         }
         json.put("bookmarks", bookmarkArray);
+        JSONArray annotationArray = new JSONArray();
+        for (Annotation annotation : annotations) {
+            annotationArray.put(annotation.toJson());
+        }
+        json.put("annotations", annotationArray);
         return json;
     }
 
@@ -63,6 +69,15 @@ final class Book {
                 JSONObject item = bookmarkArray.optJSONObject(i);
                 if (item != null) {
                     book.bookmarks.add(Bookmark.fromJson(item));
+                }
+            }
+        }
+        JSONArray annotationArray = json.optJSONArray("annotations");
+        if (annotationArray != null) {
+            for (int i = 0; i < annotationArray.length(); i++) {
+                JSONObject item = annotationArray.optJSONObject(i);
+                if (item != null) {
+                    book.annotations.add(Annotation.fromJson(item));
                 }
             }
         }
