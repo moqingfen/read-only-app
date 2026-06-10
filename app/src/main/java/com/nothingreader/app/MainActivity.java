@@ -6,6 +6,7 @@ import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.Dialog;
 import android.content.ActivityNotFoundException;
+import android.content.ClipData;
 import android.content.Intent;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
@@ -122,7 +123,7 @@ public final class MainActivity extends Activity {
     private float touchDownY;
     private boolean restoringScroll;
     private boolean readerChromeVisible = true;
-    private boolean lastExpandedLayout;
+    private int lastWidthClass;
     private String shelfFormatFilter = "ALL";
     private PdfRenderer pdfRenderer;
     private ParcelFileDescriptor pdfDescriptor;
@@ -179,7 +180,7 @@ public final class MainActivity extends Activity {
         enableEdgeToEdge();
         installWindowInsets();
         setContentView(root);
-        lastExpandedLayout = isExpandedLayout();
+        lastWidthClass = widthClass();
         installLayoutModeWatcher();
         showShelf();
         showOpeningCover();
@@ -278,7 +279,7 @@ public final class MainActivity extends Activity {
             safeInsetRight = right;
             safeInsetBottom = bottom;
             if (changed && root.getChildCount() > 0) {
-                view.post(this::renderCurrentSurface);
+                view.post(this::scheduleSurfaceRender);
             }
             return insets;
         });
@@ -326,14 +327,24 @@ public final class MainActivity extends Activity {
         showShelf();
     }
 
+    private final Runnable surfaceRenderRunnable = this::renderCurrentSurface;
+
+    private void scheduleSurfaceRender() {
+        if (epubWebView != null || markdownWebView != null) {
+            captureWebAnchor();
+        }
+        handler.removeCallbacks(surfaceRenderRunnable);
+        handler.postDelayed(surfaceRenderRunnable, 90);
+    }
+
     private void installLayoutModeWatcher() {
         root.addOnLayoutChangeListener((view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
-            boolean expanded = isExpandedLayout();
-            if (expanded == lastExpandedLayout) {
+            int currentWidthClass = widthClass();
+            if (currentWidthClass == lastWidthClass) {
                 return;
             }
-            lastExpandedLayout = expanded;
-            renderCurrentSurface();
+            lastWidthClass = currentWidthClass;
+            scheduleSurfaceRender();
         });
     }
 
@@ -346,8 +357,8 @@ public final class MainActivity extends Activity {
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
-        lastExpandedLayout = isExpandedLayout();
-        renderCurrentSurface();
+        lastWidthClass = widthClass();
+        scheduleSurfaceRender();
     }
 
     @Override
@@ -474,6 +485,7 @@ public final class MainActivity extends Activity {
         );
         page.setBackgroundColor(palette.background);
         root.addView(page, matchParent());
+        page.setOnDragListener(this::handleShelfDrag);
 
         LinearLayout chrome = page;
         LinearLayout contentColumn = page;
@@ -1084,6 +1096,36 @@ public final class MainActivity extends Activity {
         }
         if (count == 0) {
             results.addView(dialogRow("没有找到", "换个关键词试试"));
+        }
+    }
+
+    private boolean handleShelfDrag(View view, DragEvent event) {
+        switch (event.getAction()) {
+            case DragEvent.ACTION_DRAG_STARTED:
+                return event.getClipDescription() != null;
+            case DragEvent.ACTION_DROP: {
+                try {
+                    requestDragAndDropPermissions(event);
+                } catch (Exception ignored) {
+                }
+                ClipData clip = event.getClipData();
+                if (clip == null) {
+                    return false;
+                }
+                for (int i = 0; i < clip.getItemCount(); i++) {
+                    Uri uri = clip.getItemAt(i).getUri();
+                    if (uri != null) {
+                        if (clip.getItemCount() > 1) {
+                            toast("一次导入一本，已选择第一项");
+                        }
+                        importBook(uri);
+                        return true;
+                    }
+                }
+                return false;
+            }
+            default:
+                return true;
         }
     }
 
@@ -2286,11 +2328,19 @@ public final class MainActivity extends Activity {
         pdfPageCount = pdfRenderer.getPageCount();
     }
 
+    private boolean pdfDualPage() {
+        return isExpandedLayout()
+                && useTwoPageSpread()
+                && pdfPageCount > 1
+                && pdfZoom <= 1.02f;
+    }
+
     private void renderPdfPage() {
         if (pdfRenderer == null || pdfImage == null || pdfPageCount <= 0) {
             return;
         }
         pdfPageIndex = Math.max(0, Math.min(pdfPageIndex, pdfPageCount - 1));
+        boolean dual = pdfDualPage() && pdfPageIndex + 1 < pdfPageCount;
         PdfRenderer.Page page = null;
         try {
             page = pdfRenderer.openPage(pdfPageIndex);
@@ -2304,29 +2354,55 @@ public final class MainActivity extends Activity {
             }
             int horizontalPadding = pdfPageHolder == null ? dp(isExpandedLayout() ? 144 : 36) : pdfPageHolder.getPaddingLeft() + pdfPageHolder.getPaddingRight();
             int verticalPadding = pdfPageHolder == null ? dp(40) : pdfPageHolder.getPaddingTop() + pdfPageHolder.getPaddingBottom();
+            int spreadGap = dual ? dp(20) : 0;
             int availableWidth = Math.max(dp(260), frameWidth - horizontalPadding);
             int availableHeight = Math.max(dp(360), frameHeight - verticalPadding);
+            int pageAvailableWidth = dual ? Math.max(dp(180), (availableWidth - spreadGap) / 2) : availableWidth;
             float baseScale = pdfFitHeight
                     ? availableHeight / (float) Math.max(1, page.getHeight())
-                    : availableWidth / (float) Math.max(1, page.getWidth());
+                    : pageAvailableWidth / (float) Math.max(1, page.getWidth());
             float scale = Math.max(0.12f, baseScale * pdfZoom);
-            int targetWidth = Math.max(dp(220), Math.round(page.getWidth() * scale));
-            int targetHeight = Math.max(1, Math.round(page.getHeight() * scale));
+            int pageWidth = Math.max(dual ? dp(160) : dp(220), Math.round(page.getWidth() * scale));
+            int pageHeight = Math.max(1, Math.round(page.getHeight() * scale));
+            int targetWidth = dual ? pageWidth * 2 + spreadGap : pageWidth;
+            int targetHeight = pageHeight;
             long pixels = (long) targetWidth * (long) targetHeight;
             long maxPixels = 18L * 1024L * 1024L;
             if (pixels > maxPixels) {
                 float shrink = (float) Math.sqrt(maxPixels / (double) pixels);
-                targetWidth = Math.max(dp(220), Math.round(targetWidth * shrink));
-                scale = targetWidth / (float) Math.max(1, page.getWidth());
-                targetHeight = Math.max(1, Math.round(page.getHeight() * scale));
+                pageWidth = Math.max(dp(160), Math.round(pageWidth * shrink));
+                scale = pageWidth / (float) Math.max(1, page.getWidth());
+                pageHeight = Math.max(1, Math.round(page.getHeight() * scale));
+                targetWidth = dual ? pageWidth * 2 + spreadGap : pageWidth;
+                targetHeight = pageHeight;
             }
             recyclePdfBitmap();
             Bitmap bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888);
             bitmap.eraseColor(Color.WHITE);
             Matrix matrix = new Matrix();
             matrix.setScale(scale, scale);
-            Rect clip = new Rect(0, 0, targetWidth, targetHeight);
+            Rect clip = new Rect(0, 0, pageWidth, targetHeight);
             page.render(bitmap, clip, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+            page.close();
+            page = null;
+            if (dual) {
+                PdfRenderer.Page second = null;
+                try {
+                    second = pdfRenderer.openPage(pdfPageIndex + 1);
+                    float secondScale = pdfFitHeight
+                            ? targetHeight / (float) Math.max(1, second.getHeight())
+                            : pageWidth / (float) Math.max(1, second.getWidth());
+                    Matrix secondMatrix = new Matrix();
+                    secondMatrix.setScale(secondScale, secondScale);
+                    secondMatrix.postTranslate(pageWidth + spreadGap, 0);
+                    Rect secondClip = new Rect(pageWidth + spreadGap, 0, targetWidth, targetHeight);
+                    second.render(bitmap, secondClip, secondMatrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                } finally {
+                    if (second != null) {
+                        second.close();
+                    }
+                }
+            }
             pdfBitmap = bitmap;
             pdfImage.setImageBitmap(bitmap);
             ViewGroup.LayoutParams imageParams = pdfImage.getLayoutParams();
@@ -2363,7 +2439,8 @@ public final class MainActivity extends Activity {
         if (pdfRenderer == null || pdfPageCount <= 0) {
             return;
         }
-        int target = Math.max(0, Math.min(pdfPageCount - 1, pdfPageIndex + direction));
+        int step = pdfDualPage() ? 2 : 1;
+        int target = Math.max(0, Math.min(pdfPageCount - 1, pdfPageIndex + direction * step));
         if (target == pdfPageIndex) {
             return;
         }
@@ -2644,6 +2721,11 @@ public final class MainActivity extends Activity {
     }
 
     private void applyDefaultReaderChrome() {
+        // 外屏/窄屏：默认沉浸阅读，点击页面中部呼出工具栏。
+        if (isCompactLayout()) {
+            setReaderChromeVisible(false);
+            return;
+        }
         setReaderChromeVisible(readerChromeVisible);
     }
 
@@ -2778,8 +2860,14 @@ public final class MainActivity extends Activity {
     }
 
     private boolean useTwoPageSpread() {
-        // v0.3 折叠屏展开态启用双页对开；v0.2 保持单页。
-        return false;
+        if ("single".equals(settings.spread)) {
+            return false;
+        }
+        if ("double".equals(settings.spread)) {
+            return true;
+        }
+        // 自动：展开态（折叠屏内屏/平板）默认双页对开，中缝对齐居中折痕。
+        return isExpandedLayout();
     }
 
     private LinearLayout buildPageSurface(boolean expanded, int columns) {
@@ -3846,6 +3934,22 @@ public final class MainActivity extends Activity {
             page.setOnClickListener(view -> changePageModeFromDialog(true, dialog));
         }
 
+        TextView spreadLabel = dialogRow("双页对开（大屏/展开态）", "");
+        body.addView(spreadLabel);
+        LinearLayout spreadRow = controlRow();
+        TextView spreadAuto = pill("自动", "auto".equals(settings.spread));
+        TextView spreadSingle = pill("单页", "single".equals(settings.spread));
+        TextView spreadDouble = pill("双页", "double".equals(settings.spread));
+        spreadRow.addView(spreadAuto);
+        spreadRow.addView(spreadSingle);
+        spreadRow.addView(spreadDouble);
+        setMargins(spreadSingle, dp(10), 0, 0, 0);
+        setMargins(spreadDouble, dp(10), 0, 0, 0);
+        body.addView(spreadRow);
+        spreadAuto.setOnClickListener(view -> changeSpreadFromDialog("auto", dialog));
+        spreadSingle.setOnClickListener(view -> changeSpreadFromDialog("single", dialog));
+        spreadDouble.setOnClickListener(view -> changeSpreadFromDialog("double", dialog));
+
         TextView volumeLabel = dialogRow("音量键翻页", "");
         body.addView(volumeLabel);
         LinearLayout volumeRow = controlRow();
@@ -3894,6 +3998,16 @@ public final class MainActivity extends Activity {
             return;
         }
         applyReaderTextChange(restoreOffset);
+    }
+
+    private void changeSpreadFromDialog(String spread, Dialog dialog) {
+        settings.spread = spread;
+        settings.save(this);
+        dialog.dismiss();
+        if (currentBook != null) {
+            saveCurrentProgress();
+            renderCurrentSurface();
+        }
     }
 
     private void changePageModeFromDialog(boolean pageMode, Dialog dialog) {
@@ -4107,6 +4221,9 @@ public final class MainActivity extends Activity {
     private String currentProgressText() {
         if (isPdfBook(currentBook)) {
             int count = Math.max(1, pdfPageCount);
+            if (pdfDualPage() && pdfPageIndex + 1 < pdfPageCount) {
+                return (pdfPageIndex + 1) + "-" + (pdfPageIndex + 2) + " / " + count + " · " + Math.round(currentScrollProgress() * 100) + "%";
+            }
             return (pdfPageIndex + 1) + " / " + count + " · " + Math.round(currentScrollProgress() * 100) + "%";
         }
         if (isMarkdownBook(currentBook)) {
@@ -4392,10 +4509,28 @@ public final class MainActivity extends Activity {
         return "最近 " + formatTime(latest.lastOpenedAt);
     }
 
-    private boolean isExpandedLayout() {
+    private static final int WIDTH_CLASS_COMPACT = 0;
+    private static final int WIDTH_CLASS_MEDIUM = 1;
+    private static final int WIDTH_CLASS_EXPANDED = 2;
+
+    private int widthClass() {
         Configuration configuration = getResources().getConfiguration();
-        return configuration.screenWidthDp >= 700
-                || (configuration.screenWidthDp >= 600 && configuration.smallestScreenWidthDp >= 600);
+        if (configuration.screenWidthDp >= 700
+                || (configuration.screenWidthDp >= 600 && configuration.smallestScreenWidthDp >= 600)) {
+            return WIDTH_CLASS_EXPANDED;
+        }
+        if (configuration.screenWidthDp >= 600) {
+            return WIDTH_CLASS_MEDIUM;
+        }
+        return WIDTH_CLASS_COMPACT;
+    }
+
+    private boolean isExpandedLayout() {
+        return widthClass() == WIDTH_CLASS_EXPANDED;
+    }
+
+    private boolean isCompactLayout() {
+        return widthClass() == WIDTH_CLASS_COMPACT;
     }
 
     private int shelfRailWidthPx() {
