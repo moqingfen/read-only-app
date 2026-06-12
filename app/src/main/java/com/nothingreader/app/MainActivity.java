@@ -10,6 +10,8 @@ import android.content.ClipData;
 import android.content.Intent;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Insets;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -42,6 +44,7 @@ import android.text.style.BackgroundColorSpan;
 import android.text.style.ForegroundColorSpan;
 import android.text.style.LeadingMarginSpan;
 import android.text.style.UnderlineSpan;
+import android.util.LruCache;
 import android.util.TypedValue;
 import android.view.ActionMode;
 import android.view.DragEvent;
@@ -63,11 +66,13 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.content.Context;
+import android.widget.BaseAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
@@ -85,9 +90,14 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-public final class MainActivity extends Activity {
+public final class MainActivity extends Activity implements TtsService.Listener {
     private static final int REQUEST_IMPORT = 701;
+    private static final int REQUEST_BACKUP = 702;
+    private static final int REQUEST_RESTORE = 703;
+    private static final int REQUEST_NOTIFICATION_PERMISSION = 710;
     private static final int MAX_MEMORY_CACHE_TEXT_CHARS = 1_500_000;
     private static final int MAX_MEMORY_CACHE_BOOKS = 2;
     private static final int MAX_SCROLL_MODE_TEXT_CHARS = 700_000;
@@ -175,6 +185,22 @@ public final class MainActivity extends Activity {
     private int webAnchorChapter = -1;
     private static final String WEB_ANCHOR_SELECTOR = "p,h1,h2,h3,h4,h5,h6,li,blockquote,pre,table,img";
 
+    private int ttsHighlightStart = -1;
+    private int ttsHighlightEnd = -1;
+    private String ttsBookId;
+    private int ttsTextLength;
+    private ReaderContent ttsEpubContent;
+
+    private long readingSessionStart;
+    private String readingSessionBookId;
+
+    private ListView pdfList;
+    private BaseAdapter pdfListAdapter;
+    private ExecutorService pdfRenderExecutor;
+    private LruCache<Integer, Bitmap> pdfPageBitmapCache;
+    private final Map<Integer, Float> pdfPageAspects = new HashMap<>();
+    private final Object pdfRenderLock = new Object();
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -188,9 +214,126 @@ public final class MainActivity extends Activity {
         setContentView(root);
         lastWidthClass = widthClass();
         installLayoutModeWatcher();
+        TtsService.listener = this;
         showShelf();
         showOpeningCover();
         handleIncomingIntent(getIntent());
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (currentBook != null) {
+            startReadingSession(currentBook);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        flushReadingSession();
+        if (TtsService.listener == this) {
+            TtsService.listener = null;
+        }
+        super.onDestroy();
+    }
+
+    private void startReadingSession(Book book) {
+        flushReadingSession();
+        readingSessionBookId = book == null ? null : book.id;
+        readingSessionStart = System.currentTimeMillis();
+    }
+
+    private void flushReadingSession() {
+        if (readingSessionBookId != null && readingSessionStart > 0) {
+            ReadingStats.addSession(this, readingSessionBookId, System.currentTimeMillis() - readingSessionStart);
+        }
+        readingSessionBookId = null;
+        readingSessionStart = 0;
+    }
+
+    @Override
+    public void onTtsSegment(int startOffset, int endOffset) {
+        if (ttsBookId == null || currentBook == null || !ttsBookId.equals(currentBook.id)) {
+            return;
+        }
+        ttsHighlightStart = startOffset;
+        ttsHighlightEnd = endOffset;
+        boolean txtLike = !isEpubBook(currentBook) && !isMarkdownBook(currentBook) && !isPdfBook(currentBook);
+        if (txtLike && settings.pageMode && !pageStarts.isEmpty() && currentContent != null) {
+            int currentStart = pageStarts.get(Math.max(0, Math.min(pageIndex, pageStarts.size() - 1)));
+            int visibleEnd;
+            int lastVisible = pageIndex + readerColumns;
+            if (lastVisible < pageStarts.size()) {
+                visibleEnd = pageStarts.get(lastVisible);
+            } else if (lazyPagination && currentContent.fullText != null) {
+                visibleEnd = lazyPageEndAt(currentContent.fullText, Math.min(pageIndex + readerColumns - 1, pageStarts.size() - 1));
+            } else {
+                visibleEnd = Integer.MAX_VALUE;
+            }
+            if (startOffset < currentStart || startOffset >= visibleEnd) {
+                scrollToOffset(startOffset, false);
+            } else {
+                renderCurrentPage();
+            }
+        }
+    }
+
+    @Override
+    public void onTtsState(boolean playing, boolean active) {
+        if (!active) {
+            ttsHighlightStart = -1;
+            ttsHighlightEnd = -1;
+        }
+    }
+
+    @Override
+    public void onTtsStopped(int offset) {
+        ttsHighlightStart = -1;
+        ttsHighlightEnd = -1;
+        String stoppedBookId = ttsBookId;
+        ttsBookId = null;
+        if (stoppedBookId == null) {
+            return;
+        }
+        float progress = ttsTextLength > 1 ? clamp(offset / (float) (ttsTextLength - 1)) : 0.0f;
+        if (currentBook != null && stoppedBookId.equals(currentBook.id)) {
+            if (isEpubBook(currentBook)) {
+                if (ttsEpubContent != null && currentEpubDocument != null && !ttsEpubContent.chapters.isEmpty()) {
+                    int chapterIndex = 0;
+                    for (int i = 0; i < ttsEpubContent.chapters.size(); i++) {
+                        if (ttsEpubContent.chapters.get(i).startOffset <= offset) {
+                            chapterIndex = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    int chapterStart = ttsEpubContent.chapters.get(chapterIndex).startOffset;
+                    int chapterEnd = chapterIndex + 1 < ttsEpubContent.chapters.size()
+                            ? ttsEpubContent.chapters.get(chapterIndex + 1).startOffset
+                            : ttsTextLength;
+                    float inner = chapterEnd > chapterStart
+                            ? clamp((offset - chapterStart) / (float) (chapterEnd - chapterStart))
+                            : 0.0f;
+                    int target = Math.max(0, Math.min(currentEpubDocument.chapters.size() - 1, chapterIndex));
+                    epubPendingChapterProgress = inner;
+                    loadEpubChapter(target);
+                }
+            } else if (isMarkdownBook(currentBook)) {
+                restoreMarkdownWebProgress(progress, 80);
+            } else if (!isPdfBook(currentBook)) {
+                scrollToOffset(offset, false);
+            }
+            saveCurrentProgress();
+        } else {
+            for (Book book : books) {
+                if (stoppedBookId.equals(book.id)) {
+                    book.progress = Math.max(book.progress, progress);
+                    store.saveBooks(books);
+                    break;
+                }
+            }
+        }
+        ttsEpubContent = null;
     }
 
     @Override
@@ -380,16 +523,193 @@ public final class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQUEST_IMPORT || resultCode != RESULT_OK || data == null || data.getData() == null) {
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
             return;
         }
         Uri uri = data.getData();
-        try {
-            int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-            getContentResolver().takePersistableUriPermission(uri, flags);
-        } catch (Exception ignored) {
+        if (requestCode == REQUEST_IMPORT) {
+            try {
+                int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                getContentResolver().takePersistableUriPermission(uri, flags);
+            } catch (Exception ignored) {
+            }
+            importBook(uri);
+            return;
         }
-        importBook(uri);
+        if (requestCode == REQUEST_BACKUP) {
+            runBackupExport(uri);
+            return;
+        }
+        if (requestCode == REQUEST_RESTORE) {
+            confirmBackupRestore(uri);
+        }
+    }
+
+    private void showShelfMenuDialog() {
+        Dialog dialog = baseDialog("更多");
+        LinearLayout body = dialogBody(dialog);
+
+        TextView stats = dialogRow("阅读统计", "今日 " + ReadingStats.formatDuration(ReadingStats.todayMillis(this)));
+        stats.setOnClickListener(view -> {
+            dialog.dismiss();
+            showStatsDialog();
+        });
+        body.addView(stats);
+
+        TextView backup = dialogRow("备份书库", "导出书籍、进度、书签与笔记为 zip");
+        backup.setOnClickListener(view -> {
+            dialog.dismiss();
+            launchBackupExport();
+        });
+        body.addView(backup);
+
+        TextView restore = dialogRow("从备份恢复", "选择之前导出的 zip，与当前书架合并");
+        restore.setOnClickListener(view -> {
+            dialog.dismiss();
+            launchBackupRestore();
+        });
+        body.addView(restore);
+
+        showDialog(dialog);
+    }
+
+    private void showStatsDialog() {
+        Dialog dialog = baseDialog("阅读统计");
+        LinearLayout body = dialogBody(dialog);
+
+        TextView today = dialogRow("今日阅读", ReadingStats.formatDuration(ReadingStats.todayMillis(this)));
+        today.setClickable(false);
+        body.addView(today);
+
+        TextView total = dialogRow("累计阅读", ReadingStats.formatDuration(ReadingStats.totalMillis(this)));
+        total.setClickable(false);
+        body.addView(total);
+
+        int streak = ReadingStats.streakDays(this);
+        TextView streakRow = dialogRow("连续阅读", streak <= 0 ? "今天读一会儿就开始记啦" : streak + " 天");
+        streakRow.setClickable(false);
+        body.addView(streakRow);
+
+        ArrayList<Book> sorted = new ArrayList<>(books);
+        Collections.sort(sorted, (left, right) -> Long.compare(right.lastOpenedAt, left.lastOpenedAt));
+        int shown = 0;
+        for (Book book : sorted) {
+            long millis = ReadingStats.bookMillis(this, book.id);
+            if (millis <= 0) {
+                continue;
+            }
+            TextView row = dialogRow(nonEmpty(book.title, "未命名"), ReadingStats.formatDuration(millis));
+            row.setClickable(false);
+            body.addView(row);
+            shown++;
+            if (shown >= 6) {
+                break;
+            }
+        }
+        showDialog(dialog);
+    }
+
+    private void launchBackupExport() {
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/zip");
+        intent.putExtra(Intent.EXTRA_TITLE,
+                "readonly-backup-" + new SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(new java.util.Date()) + ".zip");
+        try {
+            startActivityForResult(intent, REQUEST_BACKUP);
+        } catch (ActivityNotFoundException exception) {
+            toast("无法打开文件选择器。");
+        }
+    }
+
+    private void launchBackupRestore() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"application/zip", "application/octet-stream"});
+        try {
+            startActivityForResult(intent, REQUEST_RESTORE);
+        } catch (ActivityNotFoundException exception) {
+            toast("无法打开文件选择器。");
+        }
+    }
+
+    private void runBackupExport(Uri uri) {
+        showBusy("备份中");
+        new Thread(() -> {
+            try (java.io.OutputStream output = getContentResolver().openOutputStream(uri, "w")) {
+                if (output == null) {
+                    throw new IllegalArgumentException("无法写入备份文件。");
+                }
+                store.exportBackup(output);
+                runOnUiThread(() -> {
+                    showShelf();
+                    toast("备份完成");
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> {
+                    showShelf();
+                    toast(nonEmpty(exception.getMessage(), "备份失败"));
+                });
+            }
+        }).start();
+    }
+
+    private void confirmBackupRestore(Uri uri) {
+        Dialog dialog = baseDialog("从备份恢复");
+        LinearLayout body = dialogBody(dialog);
+        TextView hint = dialogRow("恢复会把备份中的书与当前书架合并", "同一本书以备份内容为准，操作不可撤销");
+        hint.setClickable(false);
+        body.addView(hint);
+        TextView confirm = pill("开始恢复", true);
+        confirm.setGravity(Gravity.CENTER);
+        confirm.setMinHeight(dp(40));
+        confirm.setOnClickListener(view -> {
+            dialog.dismiss();
+            runBackupRestore(uri);
+        });
+        body.addView(confirm, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        setMargins(confirm, 0, dp(12), 0, 0);
+        showDialog(dialog);
+    }
+
+    private void runBackupRestore(Uri uri) {
+        showBusy("恢复中");
+        new Thread(() -> {
+            try (java.io.InputStream input = getContentResolver().openInputStream(uri)) {
+                if (input == null) {
+                    throw new IllegalArgumentException("无法读取备份文件。");
+                }
+                List<Book> restored = store.importBackup(input);
+                runOnUiThread(() -> {
+                    Map<String, Integer> indexById = new HashMap<>();
+                    for (int i = 0; i < books.size(); i++) {
+                        if (books.get(i).id != null) {
+                            indexById.put(books.get(i).id, i);
+                        }
+                    }
+                    int added = 0;
+                    for (Book book : restored) {
+                        Integer existing = book.id == null ? null : indexById.get(book.id);
+                        if (existing != null) {
+                            books.set(existing, book);
+                        } else {
+                            books.add(book);
+                            added++;
+                        }
+                    }
+                    store.saveBooks(books);
+                    contentCache.clear();
+                    showShelf();
+                    toast("恢复完成，新增 " + added + " 本");
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> {
+                    showShelf();
+                    toast(nonEmpty(exception.getMessage(), "恢复失败"));
+                });
+            }
+        }).start();
     }
 
     private void showOpeningCover() {
@@ -446,6 +766,7 @@ public final class MainActivity extends Activity {
         closeEpubWebView();
         closeMarkdownWebView();
         applyKeepScreenOn(false);
+        flushReadingSession();
         currentBook = null;
         currentContent = null;
         readerScroll = null;
@@ -533,6 +854,11 @@ public final class MainActivity extends Activity {
         importButton.setOnClickListener(view -> launchImport());
         header.addView(importButton);
         setMargins(importButton, dp(8), 0, 0, 0);
+
+        TextView more = iconButton("⋮", "更多");
+        more.setOnClickListener(view -> showShelfMenuDialog());
+        header.addView(more);
+        setMargins(more, dp(8), 0, 0, 0);
 
         View searchBar = shelfSearchBar();
         chrome.addView(searchBar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
@@ -1305,6 +1631,7 @@ public final class MainActivity extends Activity {
         refreshPalette();
         applySystemChrome(palette.readerBackground);
         applyKeepScreenOn(true);
+        startReadingSession(currentBook == null ? null : currentBook);
         root.setBackgroundColor(palette.readerBackground);
         root.removeAllViews();
         readerToolbar = null;
@@ -1885,6 +2212,7 @@ public final class MainActivity extends Activity {
         refreshPalette();
         applySystemChrome(palette.readerBackground);
         applyKeepScreenOn(true);
+        startReadingSession(currentBook == null ? null : currentBook);
         root.setBackgroundColor(palette.readerBackground);
         root.removeAllViews();
         readerToolbar = null;
@@ -2383,6 +2711,7 @@ public final class MainActivity extends Activity {
         book.lastOpenedAt = System.currentTimeMillis();
         store.saveBooks(books);
         applyKeepScreenOn(true);
+        startReadingSession(currentBook == null ? null : currentBook);
         readerSeekRow = null;
         webPaged = false;
 
@@ -2435,6 +2764,12 @@ public final class MainActivity extends Activity {
         toolbar.addView(bookmark);
         setMargins(bookmark, dp(6), 0, 0, 0);
 
+        TextView type = iconButton("Aa", "阅读设置");
+        type.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        type.setOnClickListener(view -> showSettingsDialog());
+        toolbar.addView(type);
+        setMargins(type, dp(6), 0, 0, 0);
+
         FrameLayout readingFrame = new FrameLayout(this);
         shell.addView(readingFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
         pdfReadingFrame = readingFrame;
@@ -2451,31 +2786,36 @@ public final class MainActivity extends Activity {
             }
         });
 
-        pdfHorizontalScroll = new HorizontalScrollView(this);
-        pdfHorizontalScroll.setFillViewport(true);
-        pdfHorizontalScroll.setHorizontalScrollBarEnabled(false);
-        pdfHorizontalScroll.setClipToPadding(false);
-        pdfHorizontalScroll.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
-        pdfHorizontalScroll.setBackgroundColor(palette.readerBackground);
-        readingFrame.addView(pdfHorizontalScroll, matchParent());
+        if (settings.pageMode) {
+            pdfHorizontalScroll = new HorizontalScrollView(this);
+            pdfHorizontalScroll.setFillViewport(true);
+            pdfHorizontalScroll.setHorizontalScrollBarEnabled(false);
+            pdfHorizontalScroll.setClipToPadding(false);
+            pdfHorizontalScroll.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
+            pdfHorizontalScroll.setBackgroundColor(palette.readerBackground);
+            readingFrame.addView(pdfHorizontalScroll, matchParent());
 
-        pdfScroll = new ScrollView(this);
-        pdfScroll.setFillViewport(true);
-        pdfScroll.setClipToPadding(false);
-        pdfScroll.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
-        pdfScroll.setBackgroundColor(palette.readerBackground);
-        attachPdfGesture(pdfScroll);
-        pdfHorizontalScroll.addView(pdfScroll, new HorizontalScrollView.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            pdfScroll = new ScrollView(this);
+            pdfScroll.setFillViewport(true);
+            pdfScroll.setClipToPadding(false);
+            pdfScroll.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
+            pdfScroll.setBackgroundColor(palette.readerBackground);
+            attachPdfGesture(pdfScroll);
+            pdfHorizontalScroll.addView(pdfScroll, new HorizontalScrollView.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        pdfPageHolder = new FrameLayout(this);
-        pdfPageHolder.setPadding(expanded ? dp(72) : dp(18), dp(18), expanded ? dp(72) : dp(18), dp(22));
-        pdfScroll.addView(pdfPageHolder, new ScrollView.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            pdfPageHolder = new FrameLayout(this);
+            pdfPageHolder.setPadding(expanded ? dp(72) : dp(18), dp(18), expanded ? dp(72) : dp(18), dp(22));
+            pdfScroll.addView(pdfPageHolder, new ScrollView.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        pdfImage = new ImageView(this);
-        pdfImage.setAdjustViewBounds(true);
-        pdfImage.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        pdfImage.setBackgroundColor(Color.WHITE);
-        pdfPageHolder.addView(pdfImage, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL));
+            pdfImage = new ImageView(this);
+            pdfImage.setAdjustViewBounds(true);
+            pdfImage.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            pdfImage.setBackgroundColor(Color.WHITE);
+            applyPdfColorFilter(pdfImage);
+            pdfPageHolder.addView(pdfImage, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL));
+        } else {
+            buildPdfContinuousList(readingFrame, expanded);
+        }
 
         readerReadingFrame = readingFrame;
         shell.addView(buildSeekRow(expanded), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
@@ -2504,8 +2844,213 @@ public final class MainActivity extends Activity {
 
         applyDefaultReaderChrome();
 
-        pdfImage.post(this::renderPdfPage);
+        if (pdfImage != null) {
+            pdfImage.post(this::renderPdfPage);
+        }
         updateProgressLabel();
+    }
+
+    private void buildPdfContinuousList(FrameLayout readingFrame, boolean expanded) {
+        pdfList = new ListView(this);
+        pdfList.setDivider(null);
+        pdfList.setDividerHeight(0);
+        pdfList.setVerticalScrollBarEnabled(true);
+        pdfList.setBackgroundColor(palette.readerBackground);
+        readingFrame.addView(pdfList, matchParent());
+
+        pdfRenderExecutor = Executors.newSingleThreadExecutor();
+        pdfPageAspects.clear();
+        int cacheBytes = (int) Math.min(96L * 1024L * 1024L, Runtime.getRuntime().maxMemory() / 5);
+        pdfPageBitmapCache = new LruCache<Integer, Bitmap>(cacheBytes) {
+            @Override
+            protected int sizeOf(Integer key, Bitmap value) {
+                return value.getByteCount();
+            }
+        };
+
+        int horizontalPadding = expanded ? dp(48) : dp(10);
+        pdfListAdapter = new BaseAdapter() {
+            @Override
+            public int getCount() {
+                return Math.max(0, pdfPageCount);
+            }
+
+            @Override
+            public Object getItem(int position) {
+                return position;
+            }
+
+            @Override
+            public long getItemId(int position) {
+                return position;
+            }
+
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                FrameLayout cell;
+                ImageView image;
+                if (convertView instanceof FrameLayout && ((FrameLayout) convertView).getChildAt(0) instanceof ImageView) {
+                    cell = (FrameLayout) convertView;
+                    image = (ImageView) cell.getChildAt(0);
+                } else {
+                    cell = new FrameLayout(MainActivity.this);
+                    cell.setPadding(horizontalPadding, dp(4), horizontalPadding, dp(4));
+                    image = new ImageView(MainActivity.this);
+                    image.setScaleType(ImageView.ScaleType.FIT_XY);
+                    cell.addView(image, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                }
+                int parentWidth = parent.getWidth() > 0 ? parent.getWidth() : root.getWidth();
+                int targetWidth = Math.max(dp(200), parentWidth - 2 * horizontalPadding);
+                Float aspect = pdfPageAspects.get(position);
+                float useAspect = aspect == null ? 1.4142f : aspect;
+                FrameLayout.LayoutParams imageParams = (FrameLayout.LayoutParams) image.getLayoutParams();
+                imageParams.width = ViewGroup.LayoutParams.MATCH_PARENT;
+                imageParams.height = Math.max(dp(120), Math.round(targetWidth * useAspect));
+                image.setLayoutParams(imageParams);
+                image.setTag(position);
+                applyPdfColorFilter(image);
+                Bitmap cached = pdfPageBitmapCache == null ? null : pdfPageBitmapCache.get(position);
+                if (cached != null && !cached.isRecycled()) {
+                    image.setImageBitmap(cached);
+                    image.setBackgroundColor(Color.TRANSPARENT);
+                } else {
+                    image.setImageDrawable(null);
+                    image.setBackgroundColor(isDarkTheme() && settings.pdfInvert ? Color.rgb(20, 20, 20) : Color.WHITE);
+                    enqueuePdfListRender(position, targetWidth);
+                }
+                return cell;
+            }
+        };
+        pdfList.setAdapter(pdfListAdapter);
+        pdfList.setSelection(Math.max(0, Math.min(pdfPageIndex, Math.max(0, pdfPageCount - 1))));
+        pdfList.setOnScrollListener(new android.widget.AbsListView.OnScrollListener() {
+            @Override
+            public void onScrollStateChanged(android.widget.AbsListView view, int scrollState) {
+            }
+
+            @Override
+            public void onScroll(android.widget.AbsListView view, int firstVisibleItem, int visibleItemCount, int totalItemCount) {
+                if (firstVisibleItem != pdfPageIndex) {
+                    pdfPageIndex = firstVisibleItem;
+                    updateProgressLabel();
+                    handler.removeCallbacks(saveProgressRunnable);
+                    handler.postDelayed(saveProgressRunnable, 500);
+                }
+            }
+        });
+        pdfList.setOnTouchListener((target, event) -> {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                touchDownX = event.getX();
+                touchDownY = event.getY();
+            } else if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+                float dx = event.getX() - touchDownX;
+                float dy = event.getY() - touchDownY;
+                int width = Math.max(1, target.getWidth());
+                if (Math.abs(dx) < dp(14) && Math.abs(dy) < dp(14)
+                        && event.getX() > width * 0.34f && event.getX() < width * 0.66f) {
+                    toggleReaderChrome();
+                }
+            }
+            return false;
+        });
+    }
+
+    private void enqueuePdfListRender(int position, int targetWidth) {
+        ExecutorService executor = pdfRenderExecutor;
+        if (executor == null || executor.isShutdown()) {
+            return;
+        }
+        final ListView listRef = pdfList;
+        try {
+            executor.submit(() -> {
+                Bitmap bitmap = renderPdfPageBitmap(position, targetWidth);
+                if (bitmap == null) {
+                    return;
+                }
+                runOnUiThread(() -> {
+                    if (pdfList != listRef || pdfPageBitmapCache == null || pdfListAdapter == null) {
+                        return;
+                    }
+                    pdfPageBitmapCache.put(position, bitmap);
+                    float aspect = bitmap.getHeight() / (float) Math.max(1, bitmap.getWidth());
+                    Float old = pdfPageAspects.get(position);
+                    pdfPageAspects.put(position, aspect);
+                    if (old == null || Math.abs(old - aspect) > 0.01f) {
+                        pdfListAdapter.notifyDataSetChanged();
+                        return;
+                    }
+                    for (int i = 0; i < pdfList.getChildCount(); i++) {
+                        View child = pdfList.getChildAt(i);
+                        if (child instanceof FrameLayout && ((FrameLayout) child).getChildAt(0) instanceof ImageView) {
+                            ImageView image = (ImageView) ((FrameLayout) child).getChildAt(0);
+                            if (image.getTag() instanceof Integer && (Integer) image.getTag() == position) {
+                                image.setImageBitmap(bitmap);
+                                image.setBackgroundColor(Color.TRANSPARENT);
+                            }
+                        }
+                    }
+                });
+            });
+        } catch (Exception ignored) {
+        }
+    }
+
+    private Bitmap renderPdfPageBitmap(int position, int targetWidth) {
+        synchronized (pdfRenderLock) {
+            if (pdfRenderer == null || position < 0 || position >= pdfPageCount) {
+                return null;
+            }
+            PdfRenderer.Page page = null;
+            try {
+                page = pdfRenderer.openPage(position);
+                float scale = targetWidth / (float) Math.max(1, page.getWidth());
+                int width = Math.max(64, Math.round(page.getWidth() * scale));
+                int height = Math.max(64, Math.round(page.getHeight() * scale));
+                long pixels = (long) width * (long) height;
+                long maxPixels = 5L * 1024L * 1024L;
+                if (pixels > maxPixels) {
+                    float shrink = (float) Math.sqrt(maxPixels / (double) pixels);
+                    width = Math.max(64, Math.round(width * shrink));
+                    scale = width / (float) Math.max(1, page.getWidth());
+                    height = Math.max(64, Math.round(page.getHeight() * scale));
+                }
+                Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+                bitmap.eraseColor(Color.WHITE);
+                Matrix matrix = new Matrix();
+                matrix.setScale(scale, scale);
+                page.render(bitmap, new Rect(0, 0, width, height), matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                return bitmap;
+            } catch (OutOfMemoryError error) {
+                System.gc();
+                return null;
+            } catch (Exception exception) {
+                return null;
+            } finally {
+                if (page != null) {
+                    try {
+                        page.close();
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        }
+    }
+
+    private void applyPdfColorFilter(ImageView image) {
+        if (image == null) {
+            return;
+        }
+        if (isDarkTheme() && settings.pdfInvert) {
+            ColorMatrix matrix = new ColorMatrix(new float[]{
+                    -1, 0, 0, 0, 255,
+                    0, -1, 0, 0, 255,
+                    0, 0, -1, 0, 255,
+                    0, 0, 0, 1, 0
+            });
+            image.setColorFilter(new ColorMatrixColorFilter(matrix));
+        } else {
+            image.clearColorFilter();
+        }
     }
 
     private void openPdfRenderer(Book book) throws Exception {
@@ -2627,6 +3172,15 @@ public final class MainActivity extends Activity {
         if (pdfRenderer == null || pdfPageCount <= 0) {
             return;
         }
+        if (pdfList != null) {
+            int target = Math.max(0, Math.min(pdfPageCount - 1, pdfPageIndex + direction));
+            pdfPageIndex = target;
+            pdfList.smoothScrollToPositionFromTop(target, 0, 220);
+            updateProgressLabel();
+            handler.removeCallbacks(saveProgressRunnable);
+            handler.postDelayed(saveProgressRunnable, 500);
+            return;
+        }
         int step = pdfDualPage() ? 2 : 1;
         int target = Math.max(0, Math.min(pdfPageCount - 1, pdfPageIndex + direction * step));
         if (target == pdfPageIndex) {
@@ -2671,12 +3225,31 @@ public final class MainActivity extends Activity {
 
     private void closePdfRenderer() {
         recyclePdfBitmap();
-        if (pdfRenderer != null) {
+        if (pdfRenderExecutor != null) {
             try {
-                pdfRenderer.close();
+                pdfRenderExecutor.shutdownNow();
             } catch (Exception ignored) {
             }
-            pdfRenderer = null;
+            pdfRenderExecutor = null;
+        }
+        if (pdfPageBitmapCache != null) {
+            try {
+                pdfPageBitmapCache.evictAll();
+            } catch (Exception ignored) {
+            }
+            pdfPageBitmapCache = null;
+        }
+        pdfPageAspects.clear();
+        pdfList = null;
+        pdfListAdapter = null;
+        synchronized (pdfRenderLock) {
+            if (pdfRenderer != null) {
+                try {
+                    pdfRenderer.close();
+                } catch (Exception ignored) {
+                }
+                pdfRenderer = null;
+            }
         }
         if (pdfDescriptor != null) {
             try {
@@ -2734,6 +3307,7 @@ public final class MainActivity extends Activity {
         refreshPalette();
         applySystemChrome(palette.readerBackground);
         applyKeepScreenOn(true);
+        startReadingSession(currentBook == null ? null : currentBook);
         root.setBackgroundColor(palette.readerBackground);
         root.removeAllViews();
         readerToolbar = null;
@@ -3827,6 +4401,14 @@ public final class MainActivity extends Activity {
             }
         }
 
+        if (pageSized && ttsHighlightStart >= 0 && ttsHighlightEnd > ttsHighlightStart) {
+            int from = Math.max(0, ttsHighlightStart - displayBase);
+            int to = Math.min(display.length(), ttsHighlightEnd - displayBase);
+            if (to > from && from < display.length()) {
+                span.setSpan(new BackgroundColorSpan(Color.argb(isDarkTheme() ? 90 : 64, 205, 47, 47)), from, to, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+        }
+
         if (activeSearchQuery != null && !activeSearchQuery.trim().isEmpty()) {
             String query = activeSearchQuery.trim();
             String lowerDisplay = display.toLowerCase(Locale.ROOT);
@@ -4324,6 +4906,16 @@ public final class MainActivity extends Activity {
         Dialog dialog = baseDialog("Aa");
         LinearLayout body = dialogBody(dialog);
 
+        if (!isPdfBook(currentBook)) {
+            TextView tts = dialogRow(TtsService.isActive() ? "朗读控制（朗读中）" : "朗读本书",
+                    "息屏可继续 · 通知栏控制播放");
+            tts.setOnClickListener(view -> {
+                dialog.dismiss();
+                showTtsDialog();
+            });
+            body.addView(tts);
+        }
+
         TextView fontValue = dialogRow("字号 " + Math.round(settings.fontSp), "");
         body.addView(fontValue);
 
@@ -4431,16 +5023,38 @@ public final class MainActivity extends Activity {
         indentOn.setOnClickListener(view -> changeIndentFromDialog(true, dialog));
         indentOff.setOnClickListener(view -> changeIndentFromDialog(false, dialog));
 
-        if (!isPdfBook(currentBook)) {
-            LinearLayout modeRow = controlRow();
-            TextView scroll = pill("滚动", !settings.pageMode);
-            TextView page = pill("翻页", settings.pageMode);
-            modeRow.addView(scroll);
-            modeRow.addView(page);
-            setMargins(page, dp(10), 0, 0, 0);
-            body.addView(modeRow);
-            scroll.setOnClickListener(view -> changePageModeFromDialog(false, dialog));
-            page.setOnClickListener(view -> changePageModeFromDialog(true, dialog));
+        LinearLayout modeRow = controlRow();
+        TextView scroll = pill("滚动", !settings.pageMode);
+        TextView page = pill("翻页", settings.pageMode);
+        modeRow.addView(scroll);
+        modeRow.addView(page);
+        setMargins(page, dp(10), 0, 0, 0);
+        body.addView(modeRow);
+        scroll.setOnClickListener(view -> changePageModeFromDialog(false, dialog));
+        page.setOnClickListener(view -> changePageModeFromDialog(true, dialog));
+
+        if (isPdfBook(currentBook)) {
+            TextView invertLabel = dialogRow("深色主题下 PDF 反色", "");
+            body.addView(invertLabel);
+            LinearLayout invertRow = controlRow();
+            TextView invertOn = pill("开", settings.pdfInvert);
+            TextView invertOff = pill("关", !settings.pdfInvert);
+            invertRow.addView(invertOn);
+            invertRow.addView(invertOff);
+            setMargins(invertOff, dp(10), 0, 0, 0);
+            body.addView(invertRow);
+            invertOn.setOnClickListener(view -> {
+                settings.pdfInvert = true;
+                settings.save(this);
+                dialog.dismiss();
+                renderCurrentSurface();
+            });
+            invertOff.setOnClickListener(view -> {
+                settings.pdfInvert = false;
+                settings.save(this);
+                dialog.dismiss();
+                renderCurrentSurface();
+            });
         }
 
         TextView spreadLabel = dialogRow("双页对开（大屏/展开态）", "");
@@ -4507,6 +5121,162 @@ public final class MainActivity extends Activity {
             return;
         }
         applyReaderTextChange(restoreOffset);
+    }
+
+    private void showTtsDialog() {
+        Dialog dialog = baseDialog("朗读");
+        LinearLayout body = dialogBody(dialog);
+
+        boolean active = TtsService.isActive();
+        boolean playing = TtsService.isPlaying();
+
+        TextView state = dialogRow(
+                active ? (playing ? "朗读中" : "已暂停") : "未开始",
+                active ? "可锁屏聆听，进度会自动保存" : "将从当前阅读位置开始");
+        state.setClickable(false);
+        body.addView(state);
+
+        LinearLayout controls = controlRow();
+        TextView previous = iconButton("‹", "上一段");
+        TextView toggle = iconButton(playing ? "⏸" : "▶", playing ? "暂停" : "播放");
+        TextView next = iconButton("›", "下一段");
+        TextView stop = iconButton("■", "停止");
+        controls.addView(previous);
+        controls.addView(toggle);
+        controls.addView(next);
+        controls.addView(stop);
+        setMargins(toggle, dp(10), 0, 0, 0);
+        setMargins(next, dp(10), 0, 0, 0);
+        setMargins(stop, dp(10), 0, 0, 0);
+        body.addView(controls);
+
+        previous.setOnClickListener(view -> {
+            if (TtsService.isActive()) {
+                TtsService.start(this, TtsService.ACTION_PREV);
+            }
+        });
+        next.setOnClickListener(view -> {
+            if (TtsService.isActive()) {
+                TtsService.start(this, TtsService.ACTION_NEXT);
+            }
+        });
+        toggle.setOnClickListener(view -> {
+            dialog.dismiss();
+            if (TtsService.isActive()) {
+                TtsService.start(this, TtsService.ACTION_TOGGLE);
+            } else {
+                startTtsForCurrentBook();
+            }
+        });
+        stop.setOnClickListener(view -> {
+            dialog.dismiss();
+            if (TtsService.isActive()) {
+                TtsService.start(this, TtsService.ACTION_STOP);
+            }
+        });
+
+        TextView speedLabel = dialogRow("语速", "");
+        body.addView(speedLabel);
+        LinearLayout speedRow = controlRow();
+        float[] rates = new float[]{0.8f, 1.0f, 1.25f, 1.5f, 2.0f};
+        for (int i = 0; i < rates.length; i++) {
+            float rate = rates[i];
+            TextView pill = pill(rate + "x", Math.abs(settings.ttsRate - rate) < 0.01f);
+            pill.setOnClickListener(view -> {
+                settings.ttsRate = rate;
+                settings.save(this);
+                TtsService.applyRate(rate);
+                dialog.dismiss();
+            });
+            speedRow.addView(pill);
+            if (i > 0) {
+                setMargins(pill, dp(8), 0, 0, 0);
+            }
+        }
+        body.addView(speedRow);
+
+        showDialog(dialog);
+    }
+
+    private void startTtsForCurrentBook() {
+        if (currentBook == null) {
+            return;
+        }
+        if (isPdfBook(currentBook)) {
+            toast("PDF 暂不支持朗读");
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            try {
+                requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATION_PERMISSION);
+            } catch (Exception ignored) {
+            }
+        }
+        if (currentContent != null && currentContent.fullText != null && !currentContent.fullText.isEmpty()) {
+            launchTts(currentContent.fullText, currentVisibleOffset(), null);
+            return;
+        }
+        if (isEpubBook(currentBook) && currentEpubDocument != null) {
+            Book book = currentBook;
+            float chapterProgress = epubWebProgress();
+            int chapterIndex = epubChapterIndex;
+            toast("正在准备朗读…");
+            new Thread(() -> {
+                try {
+                    ReaderContent content = store.loadCachedContent(book);
+                    if (content == null || content.parserVersion < ReaderContent.CACHE_VERSION) {
+                        content = DocumentParser.parse(new File(book.localPath), book.format, book.fileName);
+                        store.saveCachedContent(book, content);
+                    }
+                    if (content == null || content.fullText == null || content.fullText.isEmpty()) {
+                        runOnUiThread(() -> toast("无法提取正文"));
+                        return;
+                    }
+                    int offset = 0;
+                    if (!content.chapters.isEmpty()) {
+                        int index = Math.max(0, Math.min(chapterIndex, content.chapters.size() - 1));
+                        int chapterStart = content.chapters.get(index).startOffset;
+                        int chapterEnd = index + 1 < content.chapters.size()
+                                ? content.chapters.get(index + 1).startOffset
+                                : content.fullText.length();
+                        offset = chapterStart + Math.round(clamp(chapterProgress) * Math.max(0, chapterEnd - chapterStart - 1));
+                    }
+                    ReaderContent resolved = content;
+                    int resolvedOffset = offset;
+                    runOnUiThread(() -> {
+                        if (currentBook == null || !nonEmpty(currentBook.id, "").equals(nonEmpty(book.id, ""))) {
+                            return;
+                        }
+                        launchTts(resolved.fullText, resolvedOffset, resolved);
+                    });
+                } catch (Exception exception) {
+                    runOnUiThread(() -> toast(nonEmpty(exception.getMessage(), "朗读准备失败")));
+                } catch (OutOfMemoryError error) {
+                    System.gc();
+                    runOnUiThread(() -> toast("文件过大，无法朗读"));
+                }
+            }).start();
+            return;
+        }
+        toast("当前内容不支持朗读");
+    }
+
+    private void launchTts(String text, int offset, ReaderContent epubContent) {
+        if (currentBook == null || text == null || text.isEmpty()) {
+            return;
+        }
+        ttsBookId = currentBook.id;
+        ttsTextLength = text.length();
+        ttsEpubContent = epubContent;
+        TtsService.pendingText = text;
+        TtsService.pendingOffset = Math.max(0, Math.min(offset, text.length() - 1));
+        TtsService.pendingTitle = nonEmpty(currentBook.title, "read only");
+        TtsService.pendingBookId = currentBook.id;
+        TtsService.pendingRate = settings.ttsRate;
+        TtsService.listener = this;
+        TtsService.start(this, TtsService.ACTION_PLAY);
+        toast("开始朗读，可在通知栏控制");
     }
 
     private void changeFontFamilyFromDialog(String fontFamily, Dialog dialog) {
@@ -4847,7 +5617,12 @@ public final class MainActivity extends Activity {
                 return;
             }
             pdfPageIndex = Math.max(0, Math.min(pdfPageCount - 1, Math.round(clamp(progress) * Math.max(0, pdfPageCount - 1))));
-            renderPdfPage();
+            if (pdfList != null) {
+                pdfList.setSelection(pdfPageIndex);
+                updateProgressLabel();
+            } else {
+                renderPdfPage();
+            }
             saveCurrentProgress();
             return;
         }

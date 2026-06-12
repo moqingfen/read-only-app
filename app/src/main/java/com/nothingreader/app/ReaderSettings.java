@@ -16,6 +16,8 @@ final class ReaderSettings {
     String fontFamily = "default";
     String margin = "standard";
     boolean indentParagraph = true;
+    float ttsRate = 1.0f;
+    boolean pdfInvert = true;
 
     static ReaderSettings load(Context context) {
         SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -31,6 +33,8 @@ final class ReaderSettings {
         settings.fontFamily = prefs.getString("fontFamily", "default");
         settings.margin = prefs.getString("margin", "standard");
         settings.indentParagraph = prefs.getBoolean("indentParagraph", true);
+        settings.ttsRate = prefs.getFloat("ttsRate", 1.0f);
+        settings.pdfInvert = prefs.getBoolean("pdfInvert", true);
         return settings;
     }
 
@@ -48,6 +52,8 @@ final class ReaderSettings {
                 .putString("fontFamily", fontFamily)
                 .putString("margin", margin)
                 .putBoolean("indentParagraph", indentParagraph)
+                .putFloat("ttsRate", ttsRate)
+                .putBoolean("pdfInvert", pdfInvert)
                 .apply();
     }
 }

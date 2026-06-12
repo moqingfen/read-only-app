@@ -23,6 +23,10 @@ read only is a lightweight local Android reader for EPUB, TXT, Markdown, and PDF
 - Typography controls: serif font option (system font stack), narrow/standard/wide page margins, and paragraph first-line indent for TXT and EPUB (v0.4)
 - EPUB footnote popups: in-chapter anchor links open as a bubble with optional jump; cross-chapter links navigate, external links open in the browser (v0.4)
 - Follow-system dark mode theme option alongside paper/dark/e-ink (v0.4)
+- Text-to-speech listening with a foreground media service: screen-off playback, notification controls (prev/play-pause/next/stop), sentence-level highlight following in the TXT pager, speed control, progress sync back to the reader; works for TXT, Markdown, and EPUB (v0.5)
+- PDF continuous scrolling mode with async page rendering and bitmap cache, alongside the existing single-page mode; PDF color inversion in dark theme (toggleable) (v0.5)
+- Local reading statistics: today / total / streak and per-book time, no account, stored on device (v0.5)
+- Library backup & restore as a single zip (books, progress, bookmarks, highlights, notes) with cross-device path remapping (v0.5)
 - Table of contents
 - Search
 - Bookmarks

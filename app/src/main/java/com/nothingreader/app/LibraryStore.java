@@ -243,6 +243,111 @@ final class LibraryStore {
         }
     }
 
+    void exportBackup(java.io.OutputStream output) throws Exception {
+        try (java.util.zip.ZipOutputStream zip = new java.util.zip.ZipOutputStream(new java.io.BufferedOutputStream(output))) {
+            if (libraryFile.exists()) {
+                writeZipFile(zip, "library.json", libraryFile);
+            }
+            writeZipDir(zip, "books/", booksDir);
+            writeZipDir(zip, "covers/", coversDir);
+        }
+    }
+
+    List<Book> importBackup(java.io.InputStream input) throws Exception {
+        byte[] libraryJson = null;
+        try (java.util.zip.ZipInputStream zip = new java.util.zip.ZipInputStream(new java.io.BufferedInputStream(input))) {
+            java.util.zip.ZipEntry entry;
+            byte[] buffer = new byte[65536];
+            while ((entry = zip.getNextEntry()) != null) {
+                String name = entry.getName();
+                if (entry.isDirectory() || name == null) {
+                    continue;
+                }
+                if (name.contains("..")) {
+                    continue;
+                }
+                if ("library.json".equals(name)) {
+                    java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+                    int read;
+                    while ((read = zip.read(buffer)) != -1) {
+                        bytes.write(buffer, 0, read);
+                    }
+                    libraryJson = bytes.toByteArray();
+                    continue;
+                }
+                File target = null;
+                if (name.startsWith("books/")) {
+                    target = new File(booksDir, name.substring("books/".length()));
+                } else if (name.startsWith("covers/")) {
+                    target = new File(coversDir, name.substring("covers/".length()));
+                }
+                if (target == null) {
+                    continue;
+                }
+                File parent = target.getParentFile();
+                if (parent != null && !parent.exists()) {
+                    parent.mkdirs();
+                }
+                try (FileOutputStream fileOut = new FileOutputStream(target, false)) {
+                    int read;
+                    while ((read = zip.read(buffer)) != -1) {
+                        fileOut.write(buffer, 0, read);
+                    }
+                }
+            }
+        }
+        if (libraryJson == null) {
+            throw new IllegalArgumentException("备份文件里没有书库数据。");
+        }
+        ArrayList<Book> restored = new ArrayList<>();
+        JSONArray array = new JSONArray(new String(libraryJson, "UTF-8"));
+        for (int i = 0; i < array.length(); i++) {
+            JSONObject item = array.optJSONObject(i);
+            if (item == null) {
+                continue;
+            }
+            Book book = Book.fromJson(item);
+            // 备份来自其他设备时绝对路径无效，按文件名重新映射到本机目录。
+            if (book.localPath != null && !book.localPath.trim().isEmpty()) {
+                File mapped = new File(booksDir, new File(book.localPath).getName());
+                book.localPath = mapped.getAbsolutePath();
+            }
+            if (book.coverPath != null && !book.coverPath.trim().isEmpty()) {
+                File mapped = new File(coversDir, new File(book.coverPath).getName());
+                book.coverPath = mapped.exists() ? mapped.getAbsolutePath() : null;
+            }
+            File local = book.localPath == null ? null : new File(book.localPath);
+            if (local != null && local.exists() && local.length() > 0) {
+                restored.add(book);
+            }
+        }
+        return restored;
+    }
+
+    private static void writeZipDir(java.util.zip.ZipOutputStream zip, String prefix, File dir) throws Exception {
+        File[] files = dir == null ? null : dir.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File file : files) {
+            if (file.isFile()) {
+                writeZipFile(zip, prefix + file.getName(), file);
+            }
+        }
+    }
+
+    private static void writeZipFile(java.util.zip.ZipOutputStream zip, String name, File file) throws Exception {
+        zip.putNextEntry(new java.util.zip.ZipEntry(name));
+        try (InputStream input = new java.io.FileInputStream(file)) {
+            byte[] buffer = new byte[65536];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                zip.write(buffer, 0, read);
+            }
+        }
+        zip.closeEntry();
+    }
+
     private File cacheFile(Book book) {
         if (book == null || book.id == null || book.id.trim().isEmpty()) {
             return null;
