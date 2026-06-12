@@ -1706,6 +1706,14 @@ public final class MainActivity extends Activity implements TtsService.Listener 
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 return handleEpubLink(request == null ? null : request.getUrl());
             }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                if (view == epubWebView) {
+                    remeasureWebPagination(view, null);
+                }
+            }
         });
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             epubWebView.setOnScrollChangeListener((view, scrollX, scrollY, oldScrollX, oldScrollY) -> {
@@ -1889,6 +1897,26 @@ public final class MainActivity extends Activity implements TtsService.Listener 
         return webPaged && useTwoPageSpread() ? 2 : 1;
     }
 
+    // 页数测量必须可靠：body.scrollWidth 在 overflow 传播到视口后可能只返回一屏宽，
+    // 图片/字体加载完成后排版还会变宽。因此同时取 documentElement/body 的 scrollWidth
+    // 和元素右边界扫描的最大值，并用 ceil 防止最后一页被吞。
+    private static final String JS_MEASURE_PAGES =
+            "(function(){"
+                    + "var vw=Math.max(1,window.innerWidth);"
+                    + "var w=Math.max(document.documentElement?document.documentElement.scrollWidth||0:0,"
+                    + "document.body?document.body.scrollWidth||0:0);"
+                    + "try{"
+                    + "var els=document.body.querySelectorAll('p,div,h1,h2,h3,h4,h5,h6,li,img,table,blockquote,pre,section,span');"
+                    + "var n=els.length;var sx=window.scrollX||0;"
+                    + "var step=n>1600?Math.ceil(n/1600):1;"
+                    + "for(var i=0;i<n;i+=step){var r=els[i].getBoundingClientRect();"
+                    + "if(r.width>0||r.height>0){var rr=r.right+sx;if(rr>w)w=rr;}}"
+                    + "for(var j=Math.max(0,n-6);j<n;j++){var r2=els[j].getBoundingClientRect();"
+                    + "var rr2=r2.right+sx;if(rr2>w)w=rr2;}"
+                    + "}catch(e){}"
+                    + "return Math.max(1,Math.ceil((w-2)/vw));"
+                    + "})()";
+
     private void initWebPagination(WebView webView, Runnable then) {
         if (webView == null) {
             return;
@@ -1900,20 +1928,56 @@ public final class MainActivity extends Activity implements TtsService.Listener 
             }
             return;
         }
-        webView.evaluateJavascript(
-                "(function(){return Math.max(1,Math.round(document.body.scrollWidth/Math.max(1,window.innerWidth)));})()",
-                value -> {
-                    int count = 1;
-                    try {
-                        count = Math.max(1, Math.round(Float.parseFloat(value.trim())));
-                    } catch (Exception ignored) {
-                    }
+        webView.evaluateJavascript(JS_MEASURE_PAGES, value -> {
+            int count = 1;
+            try {
+                count = Math.max(1, Math.round(Float.parseFloat(value.trim())));
+            } catch (Exception ignored) {
+            }
+            webPageCount = count;
+            clampWebScrollToPages(webView);
+            if (then != null) {
+                then.run();
+            }
+            updateProgressLabel();
+            // 图片/字体异步加载可能继续撑宽排版，延迟复测一次。
+            webView.postDelayed(() -> remeasureWebPagination(webView, null), 700);
+        });
+    }
+
+    private void remeasureWebPagination(WebView webView, Runnable then) {
+        WebView current = epubWebView != null ? epubWebView : markdownWebView;
+        if (webView == null || current != webView || !webPaged) {
+            if (then != null) {
+                then.run();
+            }
+            return;
+        }
+        webView.evaluateJavascript(JS_MEASURE_PAGES, value -> {
+            try {
+                int count = Math.max(1, Math.round(Float.parseFloat(value.trim())));
+                if (count != webPageCount) {
                     webPageCount = count;
-                    if (then != null) {
-                        then.run();
-                    }
+                    clampWebScrollToPages(webView);
                     updateProgressLabel();
-                });
+                }
+            } catch (Exception ignored) {
+            }
+            if (then != null) {
+                then.run();
+            }
+        });
+    }
+
+    private void clampWebScrollToPages(WebView webView) {
+        if (webView == null || !webPaged) {
+            return;
+        }
+        int width = Math.max(1, webView.getWidth());
+        int maxX = Math.max(0, (webPageCount - 1) * width);
+        if (webView.getScrollX() > maxX) {
+            webView.scrollTo(maxX, 0);
+        }
     }
 
     private int webCurrentPage(WebView webView) {
@@ -1984,12 +2048,25 @@ public final class MainActivity extends Activity implements TtsService.Listener 
                 return;
             }
             if (target > webPageCount - 1) {
-                if (epubChapterIndex + 1 < currentEpubDocument.chapters.size()) {
-                    epubPendingChapterProgress = 0.0f;
-                    loadEpubChapter(epubChapterIndex + 1);
-                } else {
-                    animateWebScrollX(epubWebView, (webPageCount - 1) * width);
-                }
+                // 跳章前先重测页数：图片/字体加载会让章节变长，
+                // 页数过期会导致章节后半部分内容被跳过。
+                WebView webViewRef = epubWebView;
+                remeasureWebPagination(webViewRef, () -> {
+                    if (epubWebView != webViewRef || currentEpubDocument == null) {
+                        return;
+                    }
+                    int freshWidth = Math.max(1, webViewRef.getWidth());
+                    int freshCurrent = Math.round(webViewRef.getScrollX() / (float) freshWidth);
+                    int freshTarget = freshCurrent + 1;
+                    if (freshTarget <= webPageCount - 1) {
+                        animateWebScrollX(webViewRef, freshTarget * freshWidth);
+                    } else if (epubChapterIndex + 1 < currentEpubDocument.chapters.size()) {
+                        epubPendingChapterProgress = 0.0f;
+                        loadEpubChapter(epubChapterIndex + 1);
+                    } else {
+                        animateWebScrollX(webViewRef, (webPageCount - 1) * freshWidth);
+                    }
+                });
                 return;
             }
             animateWebScrollX(epubWebView, target * width);
@@ -2309,6 +2386,14 @@ public final class MainActivity extends Activity implements TtsService.Listener 
                 }
                 return true;
             }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                if (view == markdownWebView) {
+                    remeasureWebPagination(view, null);
+                }
+            }
         });
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             markdownWebView.setOnScrollChangeListener((view, scrollX, scrollY, oldScrollX, oldScrollY) -> {
@@ -2542,7 +2627,21 @@ public final class MainActivity extends Activity implements TtsService.Listener 
         if (webPaged) {
             int width = Math.max(1, markdownWebView.getWidth());
             int current = Math.round(markdownWebView.getScrollX() / (float) width);
-            int target = Math.max(0, Math.min(webPageCount - 1, current + direction));
+            int desired = current + direction;
+            if (desired > webPageCount - 1) {
+                WebView webViewRef = markdownWebView;
+                remeasureWebPagination(webViewRef, () -> {
+                    if (markdownWebView != webViewRef) {
+                        return;
+                    }
+                    int freshWidth = Math.max(1, webViewRef.getWidth());
+                    int freshCurrent = Math.round(webViewRef.getScrollX() / (float) freshWidth);
+                    int freshTarget = Math.max(0, Math.min(webPageCount - 1, freshCurrent + 1));
+                    animateWebScrollX(webViewRef, freshTarget * freshWidth);
+                });
+                return;
+            }
+            int target = Math.max(0, Math.min(webPageCount - 1, desired));
             animateWebScrollX(markdownWebView, target * width);
             return;
         }

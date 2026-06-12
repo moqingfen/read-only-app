@@ -510,7 +510,9 @@ public final class TtsService extends Service implements TextToSpeech.OnInitList
                 actionName.hashCode(),
                 intent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        return new Notification.Action.Builder((android.graphics.drawable.Icon) null, label, pending).build();
+        android.graphics.drawable.Icon icon =
+                android.graphics.drawable.Icon.createWithResource(this, R.drawable.app_icon_foreground);
+        return new Notification.Action.Builder(icon, label, pending).build();
     }
 
     private PendingIntent activityIntent() {
